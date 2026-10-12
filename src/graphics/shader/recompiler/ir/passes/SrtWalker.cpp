@@ -2,6 +2,7 @@
 
 #include "common/abi.h"
 #include "common/assert.h"
+#include "graphics/host_gpu/hostMemory.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <xbyak/xbyak.h>
@@ -15,6 +16,9 @@
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
+
+// Pointers into the first 64 KiB are never mapped, typically a null table plus an offset.
+constexpr uint64_t NullPageLimit = 0x10000ull;
 
 SrtRuntime SrtReadCapture::ObservedRuntime() {
 	auto runtime = m_source;
@@ -39,6 +43,12 @@ bool SrtReadCapture::ReadOrdinary(void* userdata, uint64_t address, std::span<ui
 	if (capture.m_source.read_memory != nullptr) {
 		if (!capture.m_source.read_memory(capture.m_source.userdata, address, values)) return false;
 	} else {
+		// Unused SRT pointers are often left null; read them as a zeroed (null) descriptor.
+		if (address < NullPageLimit) {
+			std::fill(values.begin(), values.end(), 0u);
+			return true;
+		}
+		if (!Libs::Graphics::HostMemoryRangeIsReadable(address, values.size_bytes())) return false;
 		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
 	}
 	capture.m_ranges.emplace_back(address, values.size_bytes());
@@ -442,6 +452,15 @@ void CompileSrtWalker(ResourcePlan& program) {
 	code.mov(code.r9, AddressMask & ~uint64_t {3});
 	// Follow shadPS4's VisitPointer: copy one table level in offset order, then
 	// descend through its child pointers. Seed the descriptor evaluator's memo.
+	// Stores r10 as the read's flat value and seeds its memo entry.
+	const auto store = [&](const auto& read) {
+		const auto index = read.value.ResolveInstruction()->EvaluationIndex(program.evaluation_value_count);
+		using Entry = ResourcePlan::EvaluationContext::Entry;
+		const auto slot = code.rdx + index * sizeof(Entry);
+		code.mov(code.dword[code.rsi + read.flat_offset * sizeof(uint32_t)], code.r10d);
+		code.mov(code.qword[slot + offsetof(Entry, value)], code.r10);
+		code.mov(code.qword[slot + offsetof(Entry, generation)], code.rcx);
+	};
 	const auto visit = [&](auto&& self, int32_t pointer_offset, const Reads& reads) -> void {
 		code.push(code.rdi);
 		code.mov(code.rdi, code.qword[code.rdi + pointer_offset]);
@@ -458,20 +477,30 @@ void CompileSrtWalker(ResourcePlan& program) {
 			code.cmp(code.rdi, code.r10);
 			code.ja(failed, Xbyak::CodeGenerator::T_NEAR);
 		}
+		Xbyak::Label null_table, visited_table;
+		code.cmp(code.rdi, NullPageLimit);
+		code.jb(null_table, Xbyak::CodeGenerator::T_NEAR);
 		for (const auto& [offset, read]: reads) {
-			const auto index = read->value.ResolveInstruction()->EvaluationIndex(program.evaluation_value_count);
-			using Entry = ResourcePlan::EvaluationContext::Entry;
-			const auto slot = code.rdx + index * sizeof(Entry);
 			code.mov(code.r10d, code.dword[code.rdi + offset]);
-			code.mov(code.dword[code.rsi + read->flat_offset * sizeof(uint32_t)], code.r10d);
-			code.mov(code.qword[slot + offsetof(Entry, value)], code.r10);
-			code.mov(code.qword[slot + offsetof(Entry, generation)], code.rcx);
+			store(*read);
 		}
 		for (const auto& [offset, read]: reads) {
 			const auto child = pointer_uses.find(read->value.ResolveInstruction());
 			if (child == pointer_uses.end()) continue;
 			self(self, offset, child->second);
 		}
+		code.jmp(visited_table, Xbyak::CodeGenerator::T_NEAR);
+		code.L(null_table);
+		code.xor_(code.r10d, code.r10d);
+		const auto zero = [&](auto&& zero_self, const Reads& zero_reads) -> void {
+			for (const auto& [offset, read]: zero_reads) {
+				store(*read);
+				const auto child = pointer_uses.find(read->value.ResolveInstruction());
+				if (child != pointer_uses.end()) zero_self(zero_self, child->second);
+			}
+		};
+		zero(zero, reads);
+		code.L(visited_table);
 		code.pop(code.rdi);
 	};
 	for (const auto& [reg, reads]: roots) {
@@ -691,7 +720,8 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		}
 	} else {
 		if (vector) return false;
-		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+		// Unused SRT pointers are often left null; read them as a zeroed (null) descriptor.
+		if (address >= NullPageLimit) std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 	}
 	result = word;
 	return true;
