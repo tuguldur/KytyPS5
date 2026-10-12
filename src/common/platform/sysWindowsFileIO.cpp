@@ -7,12 +7,15 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <cstdio>
 #include <windows.h> // IWYU pragma: keep
 
 #include "common/platform/sysFileIO.h"
 #include "common/platform/sysTimer.h"
 #include "common/stringUtils.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -63,10 +66,49 @@ static DWORD GetCacheAccessType(sys_file_cache_type_t t) {
 	return FILE_ATTRIBUTE_NORMAL;
 }
 
+// Reads through a host buffer and copies into `data`. The copy runs in user mode, so write-protected
+// guest pages (GPU-tracked memory) fault into the emulator's handler instead of failing the read.
+static DWORD SysFileReadBounce(HANDLE handle, uint8_t* data, uint32_t size) {
+	constexpr uint32_t                   ChunkSize = 8u * 1024u * 1024u;
+	static thread_local std::vector<uint8_t> buffer;
+	if (buffer.size() < std::min(size, ChunkSize)) {
+		buffer.resize(std::min(size, ChunkSize));
+	}
+	DWORD total = 0;
+	while (total < size) {
+		const DWORD request = std::min<DWORD>(size - total, static_cast<DWORD>(buffer.size()));
+		DWORD       read    = 0;
+		if (ReadFile(handle, buffer.data(), request, &read, nullptr) == FALSE || read == 0) {
+			break;
+		}
+		std::memcpy(data + total, buffer.data(), read);
+		total += read;
+	}
+	return total;
+}
+
 void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read) {
 	if (f.type == SYS_FILE_FILE) {
 		DWORD w = 0;
-		ReadFile(f.handle, data, size, &w, nullptr);
+		if (ReadFile(f.handle, data, size, &w, nullptr) == FALSE) {
+			const auto error = GetLastError();
+			// The kernel probes the whole destination up front and rejects the read when any page
+			// is write-protected, without raising a fault the emulator could resolve.
+			if (error == ERROR_INVALID_USER_BUFFER || error == ERROR_NOACCESS) {
+				const auto bounced = SysFileReadBounce(f.handle, static_cast<uint8_t*>(data) + w, size - w);
+				static std::atomic<uint32_t> retries {0};
+				if (retries.fetch_add(1, std::memory_order_relaxed) < 20) {
+					std::fprintf(stderr,
+					             "SysFileRead: ReadFile error=%lu, read 0x%lx of 0x%x through a host buffer\n",
+					             error, bounced, size - w);
+				}
+				w += bounced;
+			} else {
+				std::fprintf(stderr, "SysFileRead: ReadFile failed, error=%lu size=0x%x read=0x%lx\n",
+				             error, size, w);
+				std::fflush(stderr);
+			}
+		}
 		if (bytes_read != nullptr) {
 			*bytes_read = w;
 		}

@@ -442,6 +442,23 @@ void GuestGpu::WaitForIdle() {
 	}
 }
 
+bool GuestGpu::WaitForIdleFor(uint32_t micros) {
+	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
+	const auto        deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(micros);
+	Common::LockGuard lock(m_queue_mutex);
+	while (m_processing || !m_commands.empty() || m_submission_count != 0) {
+		const auto now = std::chrono::steady_clock::now();
+		if (now >= deadline) {
+			return false;
+		}
+		// The GPU thread signals one idle waiter at a time, so poll in short slices.
+		const auto left = std::chrono::duration_cast<std::chrono::microseconds>(deadline - now);
+		m_idle.WaitFor(&m_queue_mutex,
+		               static_cast<uint32_t>(std::min<int64_t>(left.count(), 1000)));
+	}
+	return true;
+}
+
 void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);

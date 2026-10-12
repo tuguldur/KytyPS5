@@ -505,6 +505,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 		m_texture_cache.ForgetColorMetaFills(vaddr, size);
+		Libs::LibKernel::Memory::DebugForgetFileData(vaddr, size);
 		if (PerfStats::Enabled()) {
 			if (m_debug_writers.size() >= 4096) m_debug_writers.clear();
 			auto& [writer_size, count] = m_debug_writers[vaddr];

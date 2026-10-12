@@ -1042,7 +1042,7 @@ void Presenter::Impl::Present() {
 			Common::LockGuard render_lock(renderer.GetMutex());
 			auto&             command = present_scheduler.BeginCommand();
 			const bool        draw_system_overlay =
-			    overlay_visual.active && swapchain.PrepareSystemOverlay();
+			    (overlay_visual.active || PerfStats::Enabled()) && swapchain.PrepareSystemOverlay();
 			swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
 			                                draw_system_overlay);
 			const auto tick = swapchain.Submit(present_scheduler);

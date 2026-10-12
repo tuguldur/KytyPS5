@@ -41,6 +41,8 @@ public:
 	void SuspendPoint();
 	// Wait for guest command processing, including all compute queues (not native GPU completion).
 	void              WaitForIdle();
+	// Like WaitForIdle, but gives up after `micros`. Returns whether the GPU went idle.
+	bool              WaitForIdleFor(uint32_t micros);
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;

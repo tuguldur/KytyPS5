@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #if defined(_WIN32)
@@ -43,6 +44,15 @@ std::chrono::steady_clock::time_point g_last_frame;
 uint64_t                              g_frames       = 0;
 uint64_t                              g_slow_frames  = 0;
 uint64_t                              g_max_frame_ns = 0;
+
+constexpr auto                        HudInterval   = std::chrono::milliseconds(500);
+constexpr size_t                      HudFrameCount = 120;
+std::chrono::steady_clock::time_point g_hud_start;
+uint64_t                              g_hud_frames = 0;
+uint64_t                              g_hud_max_ns = 0;
+HudSnapshot                           g_hud;
+std::array<float, HudFrameCount>      g_hud_frame_times {};
+size_t                                g_hud_frame_next = 0;
 
 constexpr int WaitSiteFrames = 10;
 struct WaitSite {
@@ -136,6 +146,23 @@ void FramePresented() {
 	g_slow_frames += frame_ns > SlowFrameNanos ? 1 : 0;
 	g_max_frame_ns = frame_ns > g_max_frame_ns ? frame_ns : g_max_frame_ns;
 
+	g_hud_frame_times[g_hud_frame_next] = static_cast<float>(Ms(frame_ns));
+	g_hud_frame_next                    = (g_hud_frame_next + 1) % HudFrameCount;
+	g_hud_frames++;
+	g_hud_max_ns = frame_ns > g_hud_max_ns ? frame_ns : g_hud_max_ns;
+	if (g_hud_start == std::chrono::steady_clock::time_point {}) {
+		g_hud_start = now;
+	} else if (now - g_hud_start >= HudInterval) {
+		const auto hud_ns = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(now - g_hud_start).count());
+		g_hud.fps          = static_cast<double>(g_hud_frames) * 1e9 / static_cast<double>(hud_ns);
+		g_hud.frame_avg_ms = Ms(hud_ns) / static_cast<double>(g_hud_frames);
+		g_hud.frame_max_ms = Ms(g_hud_max_ns);
+		g_hud_start        = now;
+		g_hud_frames       = 0;
+		g_hud_max_ns       = 0;
+	}
+
 	const auto elapsed = now - g_interval_start;
 	if (elapsed < ReportInterval) {
 		return;
@@ -146,14 +173,27 @@ void FramePresented() {
 	            static_cast<double>(g_frames) * 1e9 / static_cast<double>(elapsed_ns),
 	            Ms(elapsed_ns) / static_cast<double>(g_frames), Ms(g_max_frame_ns),
 	            static_cast<unsigned long long>(g_slow_frames));
+	std::vector<std::pair<double, std::string>> busiest;
 	for (size_t i = 0; i < g_counters.size(); i++) {
 		auto&      counter = g_counters[i];
 		const auto count   = counter.count.exchange(0, std::memory_order_relaxed);
 		const auto total   = counter.total.exchange(0, std::memory_order_relaxed);
 		const auto max     = counter.max.exchange(0, std::memory_order_relaxed);
+		const auto percent = 100.0 * static_cast<double>(total) / static_cast<double>(elapsed_ns);
 		std::printf(" %s %llux %.0fms (%.0f%%, max %.1fms)", SectionNames[i],
-		            static_cast<unsigned long long>(count), Ms(total),
-		            100.0 * static_cast<double>(total) / static_cast<double>(elapsed_ns), Ms(max));
+		            static_cast<unsigned long long>(count), Ms(total), percent, Ms(max));
+		if (percent >= 1.0) {
+			char line[128];
+			std::snprintf(line, sizeof(line), "%-20s %4.0f%%  %7llux  max %.1fms", SectionNames[i],
+			              percent, static_cast<unsigned long long>(count), Ms(max));
+			busiest.emplace_back(percent, line);
+		}
+	}
+	std::sort(busiest.begin(), busiest.end(),
+	          [](const auto& a, const auto& b) { return a.first > b.first; });
+	g_hud.sections.clear();
+	for (size_t i = 0; i < busiest.size() && i < 8; i++) {
+		g_hud.sections.push_back(std::move(busiest[i].second));
 	}
 	std::printf("\n");
 	PrintWaitSites(elapsed_ns);
@@ -162,6 +202,16 @@ void FramePresented() {
 	g_frames         = 0;
 	g_slow_frames    = 0;
 	g_max_frame_ns   = 0;
+}
+
+HudSnapshot GetHud() {
+	std::lock_guard lock(g_frame_mutex);
+	auto            hud = g_hud;
+	hud.frame_times_ms.reserve(HudFrameCount);
+	for (size_t i = 0; i < HudFrameCount; i++) {
+		hud.frame_times_ms.push_back(g_hud_frame_times[(g_hud_frame_next + i) % HudFrameCount]);
+	}
+	return hud;
 }
 
 } // namespace PerfStats

@@ -12,6 +12,7 @@
 #include "loader/symbolDatabase.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -179,6 +180,9 @@ static int GetHostPathStat(const std::filesystem::path& host_path, LibKernel::Fi
 static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) {
 	if (guest_path == nullptr || guest_path[0] == '\0') {
 		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+	if (LibKernel::Memory::DebugFileGuardEnabled()) {
+		std::printf("AmprResolve: %s\n", guest_path);
 	}
 
 	ResolvedPathInfo  info {};
@@ -1434,6 +1438,7 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 			break;
 		}
 		std::memcpy(reinterpret_cast<void*>(destination + *bytes_read), buffer.data(), read);
+		LibKernel::Memory::DebugRecordFileData(destination + *bytes_read, read, "ampr");
 		*bytes_read += read;
 	}
 

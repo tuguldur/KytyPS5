@@ -5,6 +5,8 @@
 
 #include <chrono>
 #include <cstdint>
+#include <string>
+#include <vector>
 
 // Lightweight timing summary printed to the console every few seconds.
 // Enabled by setting the environment variable KYTY_PERF_STATS=1.
@@ -38,6 +40,17 @@ void Add(Section section, uint64_t nanos);
 void AddWaitSite(uint64_t nanos);
 // Called once per presented guest frame; prints the summary when the interval elapses.
 void FramePresented();
+
+// On-screen HUD data: frame pacing over the last half second, recent frame times (oldest first)
+// and the busiest sections of the last printed summary.
+struct HudSnapshot {
+	double                   fps          = 0.0;
+	double                   frame_avg_ms = 0.0;
+	double                   frame_max_ms = 0.0;
+	std::vector<float>       frame_times_ms;
+	std::vector<std::string> sections;
+};
+HudSnapshot GetHud();
 
 class Scope {
 public:

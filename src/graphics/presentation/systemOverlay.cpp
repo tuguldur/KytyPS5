@@ -6,6 +6,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/stringUtils.h"
 #include "gpu_blit_shaders/gpu_imgui_hdr_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -1311,12 +1312,99 @@ struct SystemOverlay::Impl {
 		draw->PopClipRect();
 	}
 
+	// KYTY_PERF_STATS: frame pacing, frame time graph and the busiest GPU-thread sections.
+	void DrawPerfHud(vk::Extent2D frame_extent) {
+		if (!PerfStats::Enabled()) {
+			return;
+		}
+		const auto  hud   = PerfStats::GetHud();
+		const float scale = std::clamp(std::min(static_cast<float>(frame_extent.width) / 1920.0f,
+		                                        static_cast<float>(frame_extent.height) / 1080.0f),
+		                               0.65f, 1.25f);
+		const float font_size  = 17.0f * scale;
+		const float small_size = 14.0f * scale;
+		const float pad        = 8.0f * scale;
+		const float graph_h    = 44.0f * scale;
+		auto*       font       = ImGui::GetFont();
+
+		const auto  title = fmt::format("FPS {:5.1f}   {:5.1f} ms   max {:5.1f} ms", hud.fps,
+		                                hud.frame_avg_ms, hud.frame_max_ms);
+		const auto& props = graphics.physical_device_properties;
+		const auto  gpu   = fmt::format("GPU: {}", props.deviceName.data());
+		std::vector<std::string> lines;
+		lines.reserve(hud.sections.size() + 1);
+		lines.emplace_back(hud.sections.empty() ? "Last 5s: collecting..."
+		                                        : "Last 5s (% of wall time, per thread):");
+		for (const auto& section: hud.sections) {
+			lines.push_back(section);
+		}
+
+		float width = font->CalcTextSizeA(font_size, FLT_MAX, 0.0f, title.c_str()).x;
+		width       = std::max(width, font->CalcTextSizeA(small_size, FLT_MAX, 0.0f, gpu.c_str()).x);
+		for (const auto& line: lines) {
+			width = std::max(width, font->CalcTextSizeA(small_size, FLT_MAX, 0.0f, line.c_str()).x);
+		}
+		width = std::max(width, 300.0f * scale);
+		const float small_line = small_size + 2.0f * scale;
+		const float height     = pad * 2.0f + font_size + 4.0f * scale + small_line +
+		                     graph_h + 6.0f * scale + small_line * static_cast<float>(lines.size());
+
+		auto*        draw = ImGui::GetForegroundDrawList();
+		const ImVec2 origin {12.0f * scale, 12.0f * scale};
+		draw->AddRectFilled(origin, {origin.x + width + pad * 2.0f, origin.y + height},
+		                    IM_COL32(0, 0, 0, 170), 6.0f * scale);
+
+		const ImU32 fps_color = hud.fps >= 55.0   ? IM_COL32(110, 230, 120, 255)
+		                        : hud.fps >= 30.0 ? IM_COL32(240, 210, 90, 255)
+		                                          : IM_COL32(240, 100, 90, 255);
+		float y = origin.y + pad;
+		draw->AddText(font, font_size, {origin.x + pad, y}, fps_color, title.c_str());
+		y += font_size + 4.0f * scale;
+		draw->AddText(font, small_size, {origin.x + pad, y}, IM_COL32(200, 200, 210, 255),
+		              gpu.c_str());
+		y += small_line;
+
+		// Frame time graph, 0-50 ms, with 16.7 ms and 33.3 ms guides.
+		constexpr float GraphMaxMs = 50.0f;
+		const ImVec2    graph_min {origin.x + pad, y};
+		const ImVec2    graph_max {origin.x + pad + width, y + graph_h};
+		draw->AddRectFilled(graph_min, graph_max, IM_COL32(255, 255, 255, 18));
+		for (const float guide: {1000.0f / 60.0f, 1000.0f / 30.0f}) {
+			const float gy = graph_max.y - graph_h * guide / GraphMaxMs;
+			draw->AddLine({graph_min.x, gy}, {graph_max.x, gy}, IM_COL32(255, 255, 255, 50));
+		}
+		if (!hud.frame_times_ms.empty()) {
+			const float bar = width / static_cast<float>(hud.frame_times_ms.size());
+			for (size_t i = 0; i < hud.frame_times_ms.size(); i++) {
+				const float ms = hud.frame_times_ms[i];
+				if (ms <= 0.0f) {
+					continue;
+				}
+				const float h  = graph_h * std::min(ms, GraphMaxMs) / GraphMaxMs;
+				const float x  = graph_min.x + bar * static_cast<float>(i);
+				const ImU32 color = ms <= 18.0f   ? IM_COL32(110, 230, 120, 220)
+				                    : ms <= 34.0f ? IM_COL32(240, 210, 90, 220)
+				                                  : IM_COL32(240, 100, 90, 230);
+				draw->AddRectFilled({x, graph_max.y - h}, {x + std::max(bar - 1.0f, 1.0f), graph_max.y},
+				                    color);
+			}
+		}
+		y += graph_h + 6.0f * scale;
+
+		for (size_t i = 0; i < lines.size(); i++) {
+			draw->AddText(font, small_size, {origin.x + pad, y},
+			              i == 0 ? IM_COL32(170, 170, 180, 255) : IM_COL32(235, 235, 240, 255),
+			              lines[i].c_str());
+			y += small_line;
+		}
+	}
+
 	bool PrepareFrame(vk::Extent2D frame_extent, vk::Format format, uint32_t image_count) {
 		OverlaySnapshot snapshot;
 		const bool      has_overlay = GetOverlaySnapshot(&snapshot);
 		const auto now = Clock::now();
 		if (!has_overlay && !g_trophy_notification_active.load(std::memory_order_acquire) &&
-		    !g_splash_active.load(std::memory_order_acquire)) {
+		    !g_splash_active.load(std::memory_order_acquire) && !PerfStats::Enabled()) {
 			return false;
 		}
 		const auto prepared_session = snapshot.session;
@@ -1356,6 +1444,7 @@ struct SystemOverlay::Impl {
 			}
 		}
 		DrawTrophyNotification(frame_extent, now);
+		DrawPerfHud(frame_extent);
 		ImGui::Render();
 		extent = frame_extent;
 		return true;

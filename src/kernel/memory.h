@@ -119,6 +119,11 @@ bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+// Debug (KYTY_DEBUG_FILE_GUARD=1): track file data loaded into guest memory and report direct-backing
+// writes that overwrite it. Forget a range once the GPU is given it as a written binding.
+bool                   DebugFileGuardEnabled();
+void                   DebugRecordFileData(uint64_t vaddr, uint64_t size, const char* source);
+void                   DebugForgetFileData(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 

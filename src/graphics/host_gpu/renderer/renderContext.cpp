@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 
 namespace Libs::Graphics {
 
@@ -58,12 +59,54 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 	return *m_video_out;
 }
 
+// Debug switch (KYTY_DEBUG_FAULT_SYNC=1): before a guest thread reads GPU-written memory,
+// wait until the GPU thread has processed every queued guest submission, so the readback sees
+// all GPU work the guest has issued so far. Waits are bounded so a submission that waits on
+// this thread cannot deadlock it.
+static bool DebugFaultSync() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DEBUG_FAULT_SYNC");
+		const bool  on    = value != nullptr && value[0] != '\0' && value[0] != '0';
+		if (on) {
+			std::printf("KYTY_DEBUG_FAULT_SYNC: guest read faults wait for GPU idle\n");
+		}
+		return on;
+	}();
+	return enabled;
+}
+
+static void DebugFaultSyncWait(GuestGpu& gpu, PageFaultAccess access, uint64_t fault_vaddr) {
+	constexpr uint32_t            TimeoutMicros = 200'000;
+	static std::atomic<uint64_t> waits {0};
+	static std::atomic<uint64_t> timeouts {0};
+	const auto                   wait_index = waits.fetch_add(1, std::memory_order_relaxed);
+	if (gpu.WaitForIdleFor(TimeoutMicros)) {
+		if (wait_index % 5000 == 0) {
+			std::printf("FaultSync: %llu waits, %llu timeouts\n",
+			            static_cast<unsigned long long>(wait_index + 1),
+			            static_cast<unsigned long long>(timeouts.load(std::memory_order_relaxed)));
+		}
+		return;
+	}
+	const auto timeout_index = timeouts.fetch_add(1, std::memory_order_relaxed);
+	if (timeout_index < 40 || timeout_index % 100 == 0) {
+		std::printf("FaultSync timeout #%llu: %s addr=0x%llx (GPU not idle after %ums)\n",
+		            static_cast<unsigned long long>(timeout_index),
+		            access == PageFaultAccess::Write ? "write" : "read",
+		            static_cast<unsigned long long>(fault_vaddr), TimeoutMicros / 1000);
+	}
+}
+
 bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
+	}
+	if (access == PageFaultAccess::Read && DebugFaultSync() && !GuestGpu::IsGpuThread() &&
+	    !CommandScheduler::InDeferredOperation()) {
+		DebugFaultSyncWait(GetGpu(), access, fault_vaddr);
 	}
 	if (access == PageFaultAccess::Write) {
 		KYTY_PERF_SCOPE(ReadbackCpuWrite);

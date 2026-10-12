@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <climits>
 #include <cstdio>
 #include <cstring>
@@ -167,6 +168,29 @@ static uint64_t ReadDirectory(File* file, void* buf, uint64_t count) {
 		file->dents_offset += bytes;
 	}
 	return bytes;
+}
+
+// Debug (KYTY_DEBUG_FILE_GUARD=1): log reads of XML files with the destination and data checksum.
+static void DebugLogFileRead(const File* file, const void* buf, uint64_t bytes, int64_t offset) {
+	if (!Memory::DebugFileGuardEnabled() || bytes == 0) {
+		return;
+	}
+	auto name = Common::PathToString(file->real_name);
+	auto lower = name;
+	std::transform(lower.begin(), lower.end(), lower.begin(),
+	               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	if (lower.find("xml") == std::string::npos) {
+		return;
+	}
+	uint64_t    hash  = 1469598103934665603ull;
+	const auto* bytes_ptr = static_cast<const uint8_t*>(buf);
+	for (uint64_t i = 0; i < bytes; i++) {
+		hash = (hash ^ bytes_ptr[i]) * 1099511628211ull;
+	}
+	std::printf("FileRead: %s offset=%lld bytes=0x%llx dst=0x%llx fnv=0x%016llx\n", name.c_str(),
+	            static_cast<long long>(offset), static_cast<unsigned long long>(bytes),
+	            static_cast<unsigned long long>(reinterpret_cast<uint64_t>(buf)),
+	            static_cast<unsigned long long>(hash));
 }
 
 static int PosixToKernel(int posix_errno) {
@@ -408,6 +432,9 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 
 	if (path == nullptr) {
 		return KERNEL_ERROR_EINVAL;
+	}
+	if (Memory::DebugFileGuardEnabled()) {
+		std::printf("FileOpen: %s flags=0x%x\n", path, static_cast<uint32_t>(flags));
 	}
 
 	auto flags_u = static_cast<uint32_t>(flags);
@@ -662,6 +689,8 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	                         std::min<uint64_t>(nbytes, remaining));
 	uint32_t bytes_read = 0;
 	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	Memory::DebugRecordFileData(reinterpret_cast<uint64_t>(buf), bytes_read, "read");
+	DebugLogFileRead(file, buf, bytes_read, -1);
 
 	file->mutex.Unlock();
 
@@ -788,6 +817,8 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 	uint32_t bytes_read = 0;
 	file->f.Seek(offset);
 	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	Memory::DebugRecordFileData(reinterpret_cast<uint64_t>(buf), bytes_read, "pread");
+	DebugLogFileRead(file, buf, bytes_read, offset);
 	file->f.Seek(pos);
 
 	file->mutex.Unlock();
@@ -889,6 +920,7 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buffer.iov_base), count);
 		uint32_t bytes = 0;
 		file->f.Read(buffer.iov_base, count, &bytes);
+		Memory::DebugRecordFileData(reinterpret_cast<uint64_t>(buffer.iov_base), bytes, "readv");
 		bytes_read += bytes;
 		remaining -= bytes;
 		if (bytes < count) {

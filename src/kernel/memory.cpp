@@ -14,7 +14,9 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <magic_enum.hpp>
@@ -866,7 +868,128 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 	return addr;
 }
 
+// Debug switch (KYTY_DEBUG_FILE_GUARD=1): remembers guest ranges filled by file reads and reports
+// any later direct-backing write (GPU readback, metadata publish) that lands on that file data
+// before the GPU has been given the range as a written binding.
+namespace {
+
+struct FileGuardRecord {
+	uint64_t                              end;
+	std::chrono::steady_clock::time_point time;
+	const char*                           source;
+};
+
+std::mutex                          g_file_guard_mutex;
+std::map<uint64_t, FileGuardRecord> g_file_guard_records;
+std::atomic<uint64_t>               g_file_guard_hits {0};
+
+// Erases records overlapping [vaddr, end) and returns the first erased record, if any.
+bool FileGuardEraseLocked(uint64_t vaddr, uint64_t end, uint64_t* hit_start,
+                          FileGuardRecord* hit) {
+	bool found = false;
+	auto it    = g_file_guard_records.lower_bound(vaddr);
+	if (it != g_file_guard_records.begin() && std::prev(it)->second.end > vaddr) {
+		it = std::prev(it);
+	}
+	while (it != g_file_guard_records.end() && it->first < end) {
+		const auto start  = it->first;
+		const auto record = it->second;
+		it                = g_file_guard_records.erase(it);
+		if (!found && hit_start != nullptr) {
+			*hit_start = start;
+			*hit       = record;
+		}
+		found = true;
+		// Keep the parts of the record outside [vaddr, end).
+		if (start < vaddr) {
+			g_file_guard_records[start] = {vaddr, record.time, record.source};
+		}
+		if (record.end > end) {
+			g_file_guard_records[end] = {record.end, record.time, record.source};
+			it                        = g_file_guard_records.upper_bound(end);
+		}
+	}
+	return found;
+}
+
+} // namespace
+
+bool DebugFileGuardEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DEBUG_FILE_GUARD");
+		const bool  on    = value != nullptr && value[0] != '\0' && value[0] != '0';
+		if (on) {
+			std::printf("KYTY_DEBUG_FILE_GUARD: reporting GPU writes over loaded file data\n");
+		}
+		return on;
+	}();
+	return enabled;
+}
+
+void DebugRecordFileData(uint64_t vaddr, uint64_t size, const char* source) {
+	if (size == 0 || !DebugFileGuardEnabled()) {
+		return;
+	}
+	std::lock_guard lock(g_file_guard_mutex);
+	FileGuardEraseLocked(vaddr, vaddr + size, nullptr, nullptr);
+	if (g_file_guard_records.size() >= 1'000'000) {
+		g_file_guard_records.clear();
+	}
+	g_file_guard_records[vaddr] = {vaddr + size, std::chrono::steady_clock::now(), source};
+}
+
+void DebugForgetFileData(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || !DebugFileGuardEnabled()) {
+		return;
+	}
+	std::lock_guard lock(g_file_guard_mutex);
+	FileGuardEraseLocked(vaddr, vaddr + size, nullptr, nullptr);
+}
+
+static void DebugCheckFileOverwrite(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || !DebugFileGuardEnabled()) {
+		return;
+	}
+	uint64_t        start = 0;
+	FileGuardRecord record {};
+	{
+		std::lock_guard lock(g_file_guard_mutex);
+		if (!FileGuardEraseLocked(vaddr, vaddr + size, &start, &record)) {
+			return;
+		}
+	}
+	const auto index = g_file_guard_hits.fetch_add(1, std::memory_order_relaxed);
+	if (index >= 200 && index % 1000 != 0) {
+		return;
+	}
+	const auto age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                        std::chrono::steady_clock::now() - record.time)
+	                        .count();
+	std::printf("FileGuard #%llu: backing write 0x%llx+0x%llx overwrites %s data 0x%llx+0x%llx "
+	            "loaded %lldms ago, thread=%s%s",
+	            static_cast<unsigned long long>(index), static_cast<unsigned long long>(vaddr),
+	            static_cast<unsigned long long>(size), record.source,
+	            static_cast<unsigned long long>(start),
+	            static_cast<unsigned long long>(record.end - start), static_cast<long long>(age_ms),
+	            Graphics::GuestGpu::IsGpuThread() ? "gpu" : "other",
+	            Graphics::CommandScheduler::InDeferredOperation() ? " (deferred)" : "");
+#if defined(_WIN32)
+	void*      stack[8] {};
+	const auto captured = RtlCaptureStackBackTrace(1, 8, stack, nullptr);
+	const auto base     = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+	std::printf(" stack:");
+	for (USHORT i = 0; i < captured; i++) {
+		const auto address = reinterpret_cast<uint64_t>(stack[i]);
+		std::printf(" +0x%llx", static_cast<unsigned long long>(address >= base ? address - base
+		                                                                         : address));
+	}
+#endif
+	std::printf("\n");
+	std::fflush(stdout);
+}
+
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
+	DebugCheckFileOverwrite(vaddr, size);
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->TryWriteBacking(vaddr, data, size);
 }
