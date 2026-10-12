@@ -2,7 +2,6 @@
 
 #include "common/abi.h"
 #include "common/assert.h"
-#include "graphics/host_gpu/hostMemory.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <xbyak/xbyak.h>
@@ -48,7 +47,6 @@ bool SrtReadCapture::ReadOrdinary(void* userdata, uint64_t address, std::span<ui
 			std::fill(values.begin(), values.end(), 0u);
 			return true;
 		}
-		if (!Libs::Graphics::HostMemoryRangeIsReadable(address, values.size_bytes())) return false;
 		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
 	}
 	capture.m_ranges.emplace_back(address, values.size_bytes());

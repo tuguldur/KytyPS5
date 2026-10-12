@@ -2,6 +2,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
@@ -883,6 +884,7 @@ Swapchain::Status Swapchain::Present() {
 
 	vk::Result result;
 	{
+		KYTY_PERF_SCOPE(Present);
 		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
 		result = m_window.graphic_ctx.queue.presentKHR(&present);
 	}

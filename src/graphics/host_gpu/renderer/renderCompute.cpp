@@ -3,6 +3,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -29,6 +30,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -203,6 +205,7 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 	}
 	auto& cache = context.GetBufferCache();
 	if (indirect_args != 0) {
+		KYTY_PERF_SCOPE(ReadbackIndirect);
 		cache.ReadMemory(indirect_args, sizeof(vk::DispatchIndirectCommand));
 		std::memcpy(input.workgroup_counts, reinterpret_cast<const void*>(indirect_args),
 		            sizeof(input.workgroup_counts));
@@ -227,6 +230,7 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
+	KYTY_PERF_SCOPE(Dispatch);
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
@@ -312,6 +316,38 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                                 thread_group_z, mode))) {
 		ResetBindings();
 		return;
+	}
+
+	// A proven uniform fill of color metadata lets the next bind of that surface skip reading
+	// the metadata back from the GPU (see TextureCache::MaterializeColorClear).
+	auto&                texture_cache   = buffer.GetContext().GetTextureCache();
+	ShaderBufferResource meta_fill       = {};
+	uint32_t             meta_fill_value = 0;
+	uint64_t             meta_fill_size  = 0;
+	const bool           meta_fill_known =
+	    resources.specialization_reads.empty() &&
+	    ResolveComputeBufferFill(input_info, thread_group_x, thread_group_y, thread_group_z, mode,
+	                             meta_fill, meta_fill_value, meta_fill_size);
+	if (PerfStats::Enabled()) {
+		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+			const auto& resource = program.info.buffers[i];
+			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+			if (!resource.written || !texture_cache.IsColorMeta(descriptor.Base48())) continue;
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 40) {
+				std::printf("ColorMetaWriter: shader=0x%016llx buffer[%u] meta=0x%llx+0x%llx "
+				            "fill=%s value=0x%08x read=%d xor=%d spec_reads=%zu fill_kind=%u "
+				            "groups=%ux%ux%u mode=0x%x\n",
+				            static_cast<unsigned long long>(program.shader_hash), i,
+				            static_cast<unsigned long long>(descriptor.Base48()),
+				            static_cast<unsigned long long>(descriptor.GetSize()),
+				            meta_fill_known ? "yes" : "no", meta_fill_value,
+				            resource.read ? 1 : 0, program.info.has_bitwise_xor ? 1 : 0,
+				            resources.specialization_reads.size(),
+				            static_cast<uint32_t>(resources.uniform_fill.kind), thread_group_x,
+				            thread_group_y, thread_group_z, mode);
+			}
+		}
 	}
 
 	if (use_thread_dimensions) {
@@ -431,6 +467,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	// Recorded after this dispatch obtained its own written buffers, which forget older fills.
+	if (meta_fill_known) {
+		texture_cache.RecordColorMetaFill(meta_fill.Base48(), meta_fill_size, meta_fill_value);
+	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -439,6 +479,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
                                       uint64_t args_addr, uint32_t mode, bool async_compute) {
+	KYTY_PERF_SCOPE(Dispatch);
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();

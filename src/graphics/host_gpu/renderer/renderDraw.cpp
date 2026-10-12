@@ -5,6 +5,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -625,6 +626,9 @@ struct DrawEmitInfo {
 	int32_t  vertex_offset = 0;
 	uint32_t first_vertex  = 0;
 	uint32_t first_instance = 0;
+	// Set when an indexed draw reads its counts from a VkDrawIndexedIndirectCommand on the GPU.
+	vk::Buffer     indirect_buffer = nullptr;
+	vk::DeviceSize indirect_offset = 0;
 };
 
 struct DrawIndexBufferSource {
@@ -893,6 +897,7 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
+	KYTY_PERF_SCOPE(DrawPrepare);
 	const auto& shader_regs       = buffer.GetRegisters().GetShaderRegisters();
 	const auto  color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
 	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
@@ -992,6 +997,44 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 	                  draw.index_count, index_addr);
 }
 
+// Copies GPU-written guest arguments into a host indirect command. The guest layout matches
+// VkDrawIndexedIndirectCommand; native fetches take no Vulkan base vertex or first instance,
+// matching the CPU path, so only the counts and first index are copied over zeroed offsets.
+static void PrepareGpuIndirectArgs(CommandBuffer& buffer, uint64_t args_addr, bool native_offsets,
+                                   DrawEmitInfo& emit) {
+	static_assert(sizeof(vk::DrawIndexedIndirectCommand) == 20);
+	auto& cache = buffer.GetContext().GetBufferCache();
+	buffer.EndRendering();
+	const auto [args_buffer, args_offset] =
+	    cache.ObtainBuffer(args_addr, sizeof(vk::DrawIndexedIndirectCommand), false);
+	EXIT_IF(args_buffer == nullptr);
+	auto& stream               = cache.GetUtilityBuffer(MemoryUsage::Stream);
+	auto [slot, slot_offset]   = stream.Map(sizeof(vk::DrawIndexedIndirectCommand), 16);
+	EXIT_IF(slot == nullptr);
+	std::memset(slot, 0, sizeof(vk::DrawIndexedIndirectCommand));
+	stream.Commit();
+
+	const auto      native = buffer.Handle();
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
+	                       nullptr);
+	const vk::BufferCopy copy {args_offset, slot_offset,
+	                           native_offsets ? 3u * sizeof(uint32_t)
+	                                          : sizeof(vk::DrawIndexedIndirectCommand)};
+	native.copyBuffer(args_buffer->Handle(), stream.Handle(), 1, &copy);
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &after, 0, nullptr, 0,
+	                       nullptr);
+	emit.indirect_buffer = stream.Handle();
+	emit.indirect_offset = slot_offset;
+}
+
 static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_buffer,
                                const DrawCallInfo& draw, const DrawEmitInfo& emit) {
 	switch (ucfg.GetPrimType()) {
@@ -1005,7 +1048,10 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 		case Prospero::PrimitiveType::kPolygon:
 		case Prospero::PrimitiveType::kRectListLegacy:
 		case Prospero::PrimitiveType::kPatch:
-			if (draw.IsIndexed()) {
+			if (draw.IsIndexed() && emit.indirect_buffer) {
+				vk_buffer.drawIndexedIndirect(emit.indirect_buffer, emit.indirect_offset, 1,
+				                              sizeof(vk::DrawIndexedIndirectCommand));
+			} else if (draw.IsIndexed()) {
 				vk_buffer.drawIndexed(draw.index_count, draw.instance_count, 0, emit.vertex_offset,
 				                      emit.first_instance);
 			} else {
@@ -1090,6 +1136,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source,
 	                                     bool primitive_restart_enable) {
+	KYTY_PERF_SCOPE(DrawExecute);
 	auto& ucfg = buffer.GetUserConfig();
 	if (CopyDepthToColor(buffer, draw, emit, state)) {
 		return;
@@ -1238,7 +1285,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 }
 
-void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
+bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1254,17 +1301,17 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	Common::LockGuard lock(m_context.GetMutex());
 	if (args.index_count == 0 || args.instance_count == 0) {
-		return;
+		return true;
 	}
 
 	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
 		ResetBindings();
-		return;
+		return true;
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
-		return;
+		return true;
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -1290,7 +1337,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, topology)) {
-		return;
+		return true;
 	}
 
 	DrawIndexBufferSource index_source {};
@@ -1329,11 +1376,20 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	DrawRenderState state {};
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
-		return;
+		return true;
 	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, args.index_type_and_size,
 	                     args.index_addr);
+
+	const bool gpu_args = args.indirect_args_addr != 0;
+	if (gpu_args && (state.vertex_info[0].stage.program->stage == ShaderType::Mesh ||
+	                 ucfg.GetPrimType() == Prospero::PrimitiveType::kQuadListLegacy ||
+	                 buffer.GetRegisters().GetRenderControl().copy_depth_to_color)) {
+		// These paths size or reshape the draw on the CPU.
+		ResetBindings();
+		return false;
+	}
 
 	const bool indirect = args.offset_source == DrawOffsetSource::IndirectArgs;
 	const auto [vertex_offset, instance_offset] =
@@ -1345,10 +1401,15 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	const bool native_indirect = indirect && !state.vertex_info[0].fetch_embedded;
 	emit.vertex_offset  = native_indirect ? 0 : vertex_offset + args.base_vertex;
 	emit.first_instance = native_indirect ? 0 : instance_offset;
+	if (gpu_args) {
+		KYTY_PERF_SCOPE(DrawIndirectGpu);
+		PrepareGpuIndirectArgs(buffer, args.indirect_args_addr, native_indirect, emit);
+	}
 
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart);
 	ResetBindings();
+	return true;
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)

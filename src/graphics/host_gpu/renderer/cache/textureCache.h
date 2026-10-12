@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <atomic>
 #include <map>
 #include <type_traits>
 #include <unordered_map>
@@ -74,6 +75,12 @@ public:
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
+
+	// Color DCC/CMask metadata written by a compute fill whose value is known on the CPU. Binding
+	// the surface then publishes that value instead of reading the metadata back from the GPU.
+	[[nodiscard]] bool IsColorMeta(uint64_t address, uint64_t size = 0);
+	void               RecordColorMetaFill(uint64_t address, uint64_t size, uint32_t value);
+	void               ForgetColorMetaFills(uint64_t address, uint64_t size);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
@@ -177,6 +184,9 @@ private:
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	std::map<uint64_t, uint64_t>                      m_color_metas; // address -> size
+	std::map<uint64_t, std::pair<uint64_t, uint32_t>> m_color_meta_fills; // -> (size, value)
+	std::atomic<bool>                                 m_has_color_meta_fills {false};
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;

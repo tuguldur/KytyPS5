@@ -57,6 +57,9 @@ struct DrawIndexArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	// Guest address of GPU-written DrawIndexedIndirectArgs the host draw reads on the GPU. The
+	// index range then covers INDEX_BUFFER_SIZE and the counts above are upper bounds only.
+	uint64_t         indirect_args_addr         = 0;
 };
 
 struct DrawAutoArgs {
@@ -163,7 +166,9 @@ public:
 	                    std::span<PreparedBindings* const> bindings);
 
 private:
-	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
+	// Returns false only for GPU-sourced arguments this draw path cannot consume; nothing was
+	// drawn and the caller must read the arguments on the CPU instead.
+	bool DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 
 	struct GraphicsBindings {

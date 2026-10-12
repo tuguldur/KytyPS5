@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -16,6 +17,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cstring>
+#include <fmt/format.h>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -269,11 +271,13 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
+	m_texture_cache.ForgetColorMetaFills(vaddr, size);
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
+	KYTY_PERF_SCOPE(SyncReadback);
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
@@ -500,6 +504,13 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+		m_texture_cache.ForgetColorMetaFills(vaddr, size);
+		if (PerfStats::Enabled()) {
+			if (m_debug_writers.size() >= 4096) m_debug_writers.clear();
+			auto& [writer_size, count] = m_debug_writers[vaddr];
+			writer_size = std::max(writer_size, size);
+			count++;
+		}
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
@@ -603,8 +614,46 @@ bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 	return address + m_slot_buffers[id].Size() > vaddr;
 }
 
+std::pair<uint64_t, uint64_t> BufferCache::GpuDirtyRun(uint64_t vaddr) {
+	// Runs on faulting guest threads: use the region-locked tracker, page by page.
+	constexpr uint64_t Page     = TRACKER_PAGE_SIZE;
+	constexpr uint64_t MaxPages = 4096;
+	auto               start    = vaddr & ~(Page - 1);
+	if (!m_memory_tracker.IsRegionGpuModified(start, Page)) return {0, 0};
+	auto end = start + Page;
+	for (uint64_t i = 0; i < MaxPages && start >= Page &&
+	                     m_memory_tracker.IsRegionGpuModified(start - Page, Page);
+	     i++) {
+		start -= Page;
+	}
+	for (uint64_t i = 0; i < MaxPages && m_memory_tracker.IsRegionGpuModified(end, Page); i++) {
+		end += Page;
+	}
+	return {start, end};
+}
+
+std::string BufferCache::DescribeWriters(uint64_t vaddr, uint64_t size) const {
+	std::string result;
+	size_t      shown = 0;
+	for (const auto& [address, writer]: m_debug_writers) {
+		const auto& [writer_size, count] = writer;
+		if (address >= vaddr + size || address + writer_size <= vaddr) continue;
+		if (shown++ == 8) {
+			result += " ...";
+			break;
+		}
+		result += fmt::format(" 0x{:x}+0x{:x}x{}", address, writer_size, count);
+	}
+	return result.empty() ? " none" : result;
+}
+
 bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
+}
+
+void BufferCache::DiscardGpuModified(uint64_t vaddr, uint64_t size) {
+	m_gpu_modified_ranges.Subtract(vaddr, size);
+	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {

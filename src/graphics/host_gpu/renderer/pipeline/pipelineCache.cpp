@@ -4,6 +4,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -251,6 +252,7 @@ struct PipelineCache::ProgramCache {
 		template <bool HasCalls>
 		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
 		                             uint32_t push_data_cursor) {
+			KYTY_PERF_SCOPE(SrtMaterialize);
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    resource_plan, runtime, resources, specialization));
 			for (auto& candidate: permutations) {
@@ -299,6 +301,7 @@ struct PipelineCache::ProgramCache {
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
 	                               uint32_t push_data_start_dword,
 	                               std::span<const uint32_t> function_code) {
+		KYTY_PERF_SCOPE(ShaderCompile);
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {

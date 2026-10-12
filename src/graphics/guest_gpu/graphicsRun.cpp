@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -205,6 +206,7 @@ void CommandProcessor::Reset() {
 	m_index_buffer_size                = 0;
 	m_index_base_addr                  = 0;
 	m_num_instances                    = 1;
+	m_num_instances_args_addr          = 0;
 	m_predicate_skip                   = false;
 	m_user_data_marker                 = HW::UserSgprType::Unknown;
 	m_draw_indirect_args_base_addr     = 0;
@@ -242,6 +244,7 @@ void CommandProcessor::BufferInit() {
 }
 
 void CommandProcessor::BufferFlush() {
+	KYTY_PERF_SCOPE(CpFlush);
 	GetScheduler().Flush();
 }
 
@@ -537,6 +540,7 @@ void GuestGpu::ThreadRun(void* data) {
 }
 
 bool GuestGpu::Process(Submission& submission) {
+	KYTY_PERF_SCOPE(GpuProcess);
 	const bool first_slice = !submission.started;
 	auto&      cp          = GetProcessor(submission.queue_id);
 
@@ -576,6 +580,7 @@ bool GuestGpu::Process(Submission& submission) {
 				}
 			}
 			if (progressed) {
+				KYTY_PERF_SCOPE(FlushSlice);
 				cp.BufferFlush();
 			}
 			break;
@@ -597,6 +602,7 @@ bool GuestGpu::Process(Submission& submission) {
 			complete = cp.Process(submission.command_execution, submission.commands) ==
 			           Pm4ProcessResult::Complete;
 			if (submission.command_execution.MadeProgress()) {
+				KYTY_PERF_SCOPE(FlushSlice);
 				cp.BufferFlush();
 			}
 			break;
@@ -661,6 +667,12 @@ void CommandProcessor::SuspendPm4() {
 	g_current_execution->m_suspended = true;
 }
 
+static thread_local uint32_t g_current_pm4_header = 0;
+
+uint32_t GuestGpu::CurrentPm4Header() noexcept {
+	return g_current_pm4_header;
+}
+
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
@@ -721,7 +733,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			continue;
 		}
 
-		auto handler = g_cp_op_func[opcode];
+		g_current_pm4_header = packet_header;
+		auto handler         = g_cp_op_func[opcode];
 
 		if (handler == nullptr) {
 			const auto offset = total_dw - remaining_dw;
@@ -785,7 +798,8 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 		num_instances = 1;
 	}
 
-	m_num_instances = num_instances;
+	m_num_instances           = num_instances;
+	m_num_instances_args_addr = 0;
 }
 
 void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,
@@ -839,16 +853,25 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 	}
 }
 
+uint32_t CommandProcessor::NumInstances() {
+	if (m_num_instances_args_addr != 0) {
+		m_num_instances = reinterpret_cast<const DrawIndexedIndirectArgs*>(m_num_instances_args_addr)
+		                      ->instance_count;
+		m_num_instances_args_addr = 0;
+	}
+	return m_num_instances;
+}
+
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
-		args.instance_count = m_num_instances;
+		args.instance_count = NumInstances();
 	}
 	if (GraphicsRunDebugDumpEnabled() && (args.base_vertex != 0 || args.first_instance != 0)) {
 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
 		     args.base_vertex, args.first_instance);
 	}
-	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
+	(void)m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
 }
 
 void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_count) {
@@ -920,6 +943,27 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		}
 	}
 
+	// Arguments a compute shader just wrote stay on the GPU: reading them here would stall
+	// recording until the GPU drains. Only single draws whose arguments feed no SGPRs qualify.
+	if (indexed && draw_count == 1 && count_addr == nullptr && index_size != 1 &&
+	    m_index_buffer_size != 0 && registers.vertex_offset == Pm4::SH_NOP &&
+	    registers.instance_offset == Pm4::SH_NOP && registers.index_offset == Pm4::SH_NOP) {
+		const auto args_addr = m_draw_indirect_args_base_addr + data_offset;
+		if (m_renderer.GetBufferCache().IsRegionGpuModified(args_addr,
+		                                                    sizeof(DrawIndexedIndirectArgs)) &&
+		    m_renderer.GetRenderExecutor().DrawIndex(
+		        m_submit_id, CurrentBuffer(),
+		        {.index_count         = m_index_buffer_size,
+		         .index_addr          = reinterpret_cast<const void*>(m_index_base_addr),
+		         .instance_count      = 1,
+		         .index_type_and_size = m_index_type_and_size,
+		         .offset_source       = DrawOffsetSource::IndirectArgs,
+		         .indirect_args_addr  = args_addr})) {
+			m_num_instances_args_addr = args_addr;
+			return;
+		}
+	}
+
 	for (uint32_t i = 0; i < draw_count; i++) {
 		const auto args_addr = m_draw_indirect_args_base_addr + data_offset +
 		                       static_cast<uint64_t>(i) * stride_in_bytes;
@@ -929,6 +973,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 			PatchIndirectDrawOffsets(*this, registers, args->start_vertex_location,
 			                         args->start_instance_location, 0);
 			m_num_instances = args->instance_count;
+			m_num_instances_args_addr = 0;
 			DrawIndexAuto({.vertex_count   = args->vertex_count_per_instance,
 			               .instance_count = args->instance_count,
 			               .first_vertex   = args->start_vertex_location,
@@ -938,6 +983,22 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		}
 
 		auto* args = reinterpret_cast<const DrawIndexedIndirectArgs*>(args_addr);
+		if (PerfStats::Enabled()) {
+			static std::atomic<uint32_t> logged {0};
+			const auto index = logged.fetch_add(1, std::memory_order_relaxed);
+			if (index < 30 || index % 500 == 0) {
+				std::printf("IndirectDraw #%u: draws=%u/%u count_addr=%d stride=%u regs(vtx=0x%x "
+				            "inst=0x%x idx=0x%x) args=0x%llx idx_count=%u inst=%u first_idx=%u "
+				            "base_vtx=%d first_inst=%u ib_size=%u\n",
+				            index, i, draw_count, count_addr != nullptr ? 1 : 0, stride_in_bytes,
+				            registers.vertex_offset, registers.instance_offset,
+				            registers.index_offset, static_cast<unsigned long long>(args_addr),
+				            args->index_count_per_instance, args->instance_count,
+				            args->start_index_location,
+				            static_cast<int32_t>(args->base_vertex_location),
+				            args->start_instance_location, m_index_buffer_size);
+			}
+		}
 		PatchIndirectDrawOffsets(*this, registers, args->base_vertex_location,
 		                         args->start_instance_location, args->start_index_location);
 
@@ -958,6 +1019,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		}
 
 		m_num_instances = args->instance_count;
+		m_num_instances_args_addr = 0;
 		DrawIndex({.index_count    = index_count,
 		           .index_addr     = index_addr,
 		           .instance_count = args->instance_count,
@@ -1012,7 +1074,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	if (args.instance_count == 0) {
-		args.instance_count = m_num_instances;
+		args.instance_count = NumInstances();
 	}
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
 }

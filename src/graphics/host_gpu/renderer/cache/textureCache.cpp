@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/tile.h"
@@ -18,12 +19,16 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <span>
+#include <string>
 #include <tuple>
 #include <vulkan/vulkan_format_traits.hpp>
 
@@ -1072,6 +1077,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		image.info.metadata = desc.info.metadata;
 		// Native color metadata must not retain a reused HTile/CMask/FMask clear flag.
 		m_surface_metas.erase(range.address);
+		if (range.size != 0) m_color_metas[range.address] = range.size;
 		if (range.size == 0 || desc.info.resources.levels != 1) {
 			return;
 		}
@@ -1093,9 +1099,33 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	}
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
-	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
-		m_buffer_cache.ReadMemory(range.address, range.size, false);
+	const bool  readback   = m_buffer_cache.IsRegionGpuModified(range.address, range.size);
+	bool        known_fill = false;
+	std::string writers;
+	if (readback) {
+		if (PerfStats::Enabled()) writers = m_buffer_cache.DescribeWriters(range.address, range.size);
+		std::optional<uint32_t> fill;
+		{
+			std::scoped_lock lock {m_lock};
+			const auto       found = m_color_meta_fills.find(range.address);
+			if (found != m_color_meta_fills.end() && found->second.first == range.size) {
+				fill = found->second.second;
+				m_color_meta_fills.erase(found);
+			}
+		}
+		if (fill.has_value()) {
+			// The GPU fill is already recorded, so its result is known: publish it to the backing
+			// as a completed download would, without waiting for the GPU.
+			known_fill = true;
+			const std::vector<uint32_t> words(range.size / sizeof(uint32_t), *fill);
+			LibKernel::Memory::WriteBacking(range.address, words.data(), range.size);
+			m_buffer_cache.DiscardGpuModified(range.address, range.size);
+		} else {
+			KYTY_PERF_SCOPE(ColorMetaReadback);
+			m_buffer_cache.ReadMemory(range.address, range.size, false);
+		}
 	}
+	uint32_t   cleared    = 0;
 	const auto slice_size = range.size / layers;
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = range.address + slice_size * (first + slice);
@@ -1127,12 +1157,26 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			            view.base_level, view.level_count,
 			            image_first + slice, 1}, clear);
 		}
+		cleared++;
 		// Publish the conversion's expanded keys without treating them as guest writes
 		// to overlapping image data. Invalidate the buffer before updating its backing.
 		if (desc.type != BindingType::VideoOut) {
 			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
 			m_buffer_cache.InvalidateMemory(address, slice_size);
 			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
+		}
+	}
+	if (readback && PerfStats::Enabled()) {
+		static std::atomic<uint64_t> readbacks {0};
+		const auto                   index = readbacks.fetch_add(1);
+		if (index < 40 || index % 2000 == 0) {
+			std::printf("ColorMetaReadback #%llu: %s%s meta=0x%llx+0x%llx image=%ux%u layers=%u "
+			            "cleared=%u/%u writers:%s\n",
+			            static_cast<unsigned long long>(index), known_fill ? "known-fill " : "",
+			            desc.info.metadata.kind == ImageMetadataKind::Dcc ? "DCC" : "CMask",
+			            static_cast<unsigned long long>(range.address),
+			            static_cast<unsigned long long>(range.size), desc.info.extent.width,
+			            desc.info.extent.height, layers, cleared, count, writers.c_str());
 		}
 	}
 }
@@ -1876,6 +1920,42 @@ bool TextureCache::IsMeta(uint64_t address) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	return found != m_surface_metas.end();
+}
+
+bool TextureCache::IsColorMeta(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_color_metas.find(address);
+	return found != m_color_metas.end() && (size == 0 || found->second == size);
+}
+
+void TextureCache::RecordColorMetaFill(uint64_t address, uint64_t size, uint32_t value) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_color_metas.find(address);
+	if (found == m_color_metas.end() || found->second != size) {
+		return;
+	}
+	m_color_meta_fills[address] = {size, value};
+	m_has_color_meta_fills.store(true, std::memory_order_relaxed);
+}
+
+void TextureCache::ForgetColorMetaFills(uint64_t address, uint64_t size) {
+	if (!m_has_color_meta_fills.load(std::memory_order_relaxed)) {
+		return;
+	}
+	std::scoped_lock lock {m_lock};
+	const auto       end = address + size;
+	auto             it  = m_color_meta_fills.lower_bound(address);
+	if (it != m_color_meta_fills.begin()) {
+		it = std::prev(it);
+	}
+	while (it != m_color_meta_fills.end() && it->first < end) {
+		if (it->first + it->second.first > address) {
+			it = m_color_meta_fills.erase(it);
+		} else {
+			++it;
+		}
+	}
+	m_has_color_meta_fills.store(!m_color_meta_fills.empty(), std::memory_order_relaxed);
 }
 
 bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {

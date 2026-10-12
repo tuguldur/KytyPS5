@@ -2,11 +2,15 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/guest_gpu/pm4.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 
 namespace Libs::Graphics {
 
@@ -62,9 +66,27 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
+		KYTY_PERF_SCOPE(ReadbackCpuWrite);
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
+		KYTY_PERF_SCOPE(ReadbackCpuRead);
+		if (PerfStats::Enabled()) {
+			static std::atomic<uint32_t> logged {0};
+			const auto index = logged.fetch_add(1, std::memory_order_relaxed);
+			if (index < 40 || index % 200 == 0) {
+				const auto [start, end] = m_buffer_cache.GpuDirtyRun(fault_vaddr);
+				const bool gpu_thread   = GuestGpu::IsGpuThread();
+				const auto header       = gpu_thread ? GuestGpu::CurrentPm4Header() : 0u;
+				std::printf("CpuReadFault #%u: %s pm4_op=0x%02x pm4_r=0x%02x addr=0x%llx "
+				            "dirty_run=0x%llx+0x%llx\n",
+				            index, gpu_thread ? "gpu-thread" : "guest-thread",
+				            (header >> 8u) & 0xffu, static_cast<uint32_t>(KYTY_PM4_R(header)),
+				            static_cast<unsigned long long>(fault_vaddr),
+				            static_cast<unsigned long long>(start),
+				            static_cast<unsigned long long>(end - start));
+			}
+		}
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;

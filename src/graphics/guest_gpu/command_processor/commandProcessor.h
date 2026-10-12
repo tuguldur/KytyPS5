@@ -82,7 +82,8 @@ public:
 		return m_dispatch_indirect_args_base_addr;
 	}
 	void SetNumInstances(uint32_t num_instances);
-	void DrawIndex(DrawIndexArgs args);
+	void     DrawIndex(DrawIndexArgs args);
+	uint32_t NumInstances();
 	void DrawIndexOffset(uint32_t index_offset, uint32_t index_count);
 	void DrawIndexAuto(DrawAutoArgs args);
 	void DrawIndirect(uint32_t data_offset, IndirectDrawRegisters registers,
@@ -172,6 +173,8 @@ private:
 	uint64_t         m_dispatch_indirect_args_base_addr = 0;
 	// Persistent draw state: indirect draws update it for subsequent draws.
 	uint32_t m_num_instances = 1;
+	// Instance count left in GPU-written indirect arguments; read only if a later draw uses it.
+	uint64_t m_num_instances_args_addr = 0;
 
 	uint32_t m_de_count    = 0;
 	uint32_t m_ce_count    = 0;

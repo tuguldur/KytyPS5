@@ -977,6 +977,19 @@ public:
 		if (!frame) {
 			return false;
 		}
+		if (!deliver_seek_frame && sync_mode == 0) {
+			// A guest that polls late gets the newest due frame. Returning one stale frame per
+			// call would let video fall further behind the audio clock after every hitch.
+			const auto now = CurrentTimeNoLock();
+			const auto due = [now](const ReadyFrame& candidate) {
+				return now != 0 && candidate.info.time_stamp + candidate.timestamp_offset <= now;
+			};
+			while (auto newer = video_frames.TryPopIf(due)) {
+				RecordLoopBoundary(*frame);
+				video_buffers.Push(std::move(frame->buffer));
+				frame = std::move(newer);
+			}
+		}
 		if (current_video) {
 			video_buffers.Push(std::move(current_video->buffer));
 		}

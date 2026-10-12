@@ -3,6 +3,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/perfStats.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -1274,6 +1275,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 		requests[i - 1].cfg->mutex.Unlock();
 	}
 	if (due) {
+		PerfStats::FramePresented();
 		Graphics::RenderDocOnGuestFlip(m_presenter.Renderer());
 		if (Config::GraphicsDebugDumpEnabled() &&
 		    Config::GetPrintfDirection() != Config::LogDirection::Silent) {

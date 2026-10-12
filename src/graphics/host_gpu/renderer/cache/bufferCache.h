@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <map>
+#include <string>
 #include <span>
 #include <utility>
 #include <vector>
@@ -79,9 +80,15 @@ public:
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// The caller published the GPU result to the guest backing itself; no download is needed.
+	void               DiscardGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
+	// Debug (KYTY_PERF_STATS): writable bindings recorded over [vaddr, vaddr + size).
+	[[nodiscard]] std::string DescribeWriters(uint64_t vaddr, uint64_t size) const;
+	// Debug (KYTY_PERF_STATS): the contiguous GPU-dirty run around vaddr, or {0, 0}.
+	[[nodiscard]] std::pair<uint64_t, uint64_t> GpuDirtyRun(uint64_t vaddr);
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -131,6 +138,7 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	std::map<uint64_t, std::pair<uint64_t, uint64_t>> m_debug_writers; // vaddr -> (size, count)
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;

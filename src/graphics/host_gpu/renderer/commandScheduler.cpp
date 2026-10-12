@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
@@ -351,6 +352,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	vk::Result result;
 	uint64_t   tick;
 	{
+		KYTY_PERF_SCOPE(QueueSubmit);
 		Common::LockGuard lock(graphics.queue_mutex);
 		tick = m_master.NextTick();
 		submit.AddSignal(m_master.Handle(), tick);

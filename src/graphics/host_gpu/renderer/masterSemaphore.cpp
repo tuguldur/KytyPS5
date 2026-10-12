@@ -1,7 +1,12 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 #include "common/assert.h"
+#include "common/perfStats.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+
+#include <chrono>
+#include <optional>
 
 namespace Libs::Graphics {
 
@@ -39,6 +44,23 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	if (IsFree(tick)) {
 		return;
 	}
+	std::optional<PerfStats::Scope> perf;
+	const bool profile = PerfStats::Enabled() && GuestGpu::IsGpuThread();
+	const auto start   = profile ? std::chrono::steady_clock::now()
+	                             : std::chrono::steady_clock::time_point {};
+	if (profile) perf.emplace(PerfStats::Section::GpuWait);
+	struct SiteScope {
+		bool                                  active;
+		std::chrono::steady_clock::time_point start;
+		~SiteScope() {
+			if (active) {
+				PerfStats::AddWaitSite(static_cast<uint64_t>(
+				    std::chrono::duration_cast<std::chrono::nanoseconds>(
+				        std::chrono::steady_clock::now() - start)
+				        .count()));
+			}
+		}
+	} site_scope {profile, start};
 	Refresh();
 	if (IsFree(tick)) {
 		return;
