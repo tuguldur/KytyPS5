@@ -601,6 +601,75 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
 }
 
+void BufferCache::RefreshPolledRange(uint64_t vaddr, uint64_t size,
+                                     Common::UniqueFunction<void>&& done) {
+	// Only GPU-modified bytes are copied back: other bytes may hold newer, not yet uploaded CPU
+	// writes. The tracker and dirty ranges stay as they are, so a later synchronous readback
+	// still downloads everything the guest has not been served.
+	std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	uint64_t                                   total = 0;
+	if (IsRegionRegistered(vaddr, size)) {
+		m_gpu_modified_ranges.ForEachInRange(vaddr, size, [&](uint64_t start, uint64_t end) {
+			ranges.emplace_back(start, end - start);
+			total += Common::AlignUp(end - start, 16);
+		});
+	}
+	if (ranges.empty()) {
+		done();
+		return;
+	}
+	auto& buffer          = m_slot_buffers[FindBuffer(vaddr, size)];
+	auto [mapped, offset] = m_download_buffer.Map(total, 16, false);
+	if (mapped == nullptr) {
+		done();
+		return;
+	}
+	m_download_buffer.Commit();
+	std::vector<vk::BufferCopy> copies;
+	uint64_t                    cursor = offset;
+	for (const auto& [start, bytes]: ranges) {
+		copies.emplace_back(buffer.Offset(start), cursor, bytes);
+		cursor += Common::AlignUp(bytes, 16);
+	}
+
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto              native = command.Handle();
+	vk::BufferMemoryBarrier before {};
+	before.srcAccessMask       = vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.buffer              = buffer.Handle();
+	before.offset              = 0;
+	before.size                = buffer.Size();
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
+	                       nullptr);
+	native.copyBuffer(buffer.Handle(), m_download_buffer.Handle(),
+	                  static_cast<uint32_t>(copies.size()), copies.data());
+	vk::BufferMemoryBarrier after {};
+	after.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+	after.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	after.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	after.buffer              = m_download_buffer.Handle();
+	after.offset              = offset;
+	after.size                = total;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+	                       {}, 0, nullptr, 1, &after, 0, nullptr);
+	m_scheduler.DeferPriorityOperation([this, mapped, offset, total, ranges = std::move(ranges),
+	                                    done = std::move(done)]() mutable {
+		m_download_buffer.Invalidate(offset, total);
+		uint64_t cursor = 0;
+		for (const auto& [start, bytes]: ranges) {
+			Libs::LibKernel::Memory::WriteBacking(start, mapped + cursor, bytes);
+			cursor += Common::AlignUp(bytes, 16);
+		}
+		done();
+	});
+}
+
 bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid registered-region query\n");
@@ -631,6 +700,17 @@ std::pair<uint64_t, uint64_t> BufferCache::GpuDirtyRun(uint64_t vaddr) {
 		end += Page;
 	}
 	return {start, end};
+}
+
+std::string BufferCache::DescribeGpuModified(uint64_t vaddr, uint64_t size) {
+	std::string result;
+	size_t      shown = 0;
+	m_gpu_modified_ranges.ForEachInRange(vaddr, size, [&](uint64_t start, uint64_t end) {
+		if (shown++ < 6) {
+			result += fmt::format(" +0x{:x}..+0x{:x}", start - vaddr, end - vaddr);
+		}
+	});
+	return result.empty() ? " none" : result;
 }
 
 std::string BufferCache::DescribeWriters(uint64_t vaddr, uint64_t size) const {

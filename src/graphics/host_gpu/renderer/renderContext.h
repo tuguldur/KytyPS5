@@ -15,8 +15,11 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
+#include <atomic>
+#include <map>
 #include <memory>
 #include <shared_mutex>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::VideoOut {
@@ -49,6 +52,10 @@ public:
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+	// Guest-thread loads from a small GPU-written range the guest keeps polling: returns the
+	// guest backing without draining the GPU and refreshes it asynchronously, as a real GPU
+	// would update shared memory. False until the range has faulted often enough.
+	[[nodiscard]] bool TryServePolledRead(uint64_t vaddr, void* data, uint64_t size) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
@@ -81,6 +88,13 @@ private:
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
+	struct PolledRange {
+		uint64_t          size = 0;
+		std::atomic<bool> refresh_pending {false};
+	};
+	std::shared_mutex                                       m_polled_mutex;
+	std::map<uint64_t, std::unique_ptr<PolledRange>>        m_polled_ranges;
+	std::unordered_map<uint64_t, uint32_t>                  m_poll_counts;
 	bool                      m_bda_logged = false;
 
 	Common::Mutex                        m_interrupt_mutex;

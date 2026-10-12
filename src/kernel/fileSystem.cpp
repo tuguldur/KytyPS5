@@ -20,9 +20,11 @@
 #include <cctype>
 #include <climits>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <random>
+#include <string>
 #include <system_error>
 #include <vector>
 
@@ -427,7 +429,7 @@ std::filesystem::path GetRealFilename(const std::string& mounted_file_name) {
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
+static int KernelOpenImpl(const char* path, int flags, uint16_t mode) {
 	PRINT_NAME();
 
 	if (path == nullptr) {
@@ -581,7 +583,7 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	return descriptor;
 }
 
-int KYTY_SYSV_ABI KernelClose(int d) {
+static int KernelCloseImpl(int d) {
 	PRINT_NAME();
 
 	if (d < DESCRIPTOR_MIN) {
@@ -635,7 +637,7 @@ int KYTY_SYSV_ABI KernelFcntl(int d, int command, int arg) {
 	}
 }
 
-int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
+static int64_t KernelReadImpl(int d, void* buf, size_t nbytes) {
 	PRINT_NAME();
 
 	if (d < DESCRIPTOR_MIN) {
@@ -769,7 +771,7 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 	return bytes_written;
 }
 
-int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offset) {
+static int64_t KernelPreadImpl(int d, void* buf, size_t nbytes, int64_t offset) {
 	PRINT_NAME();
 
 	if (d < DESCRIPTOR_MIN) {
@@ -860,7 +862,7 @@ static int ValidateIovecs(const KernelIovec* iov, int iovcnt, int64_t offset,
 	return OK;
 }
 
-int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, int64_t offset) {
+static int64_t KernelPreadvImpl(int d, const KernelIovec* iov, int iovcnt, int64_t offset) {
 	PRINT_NAME();
 
 	std::vector<KernelIovec> buffers;
@@ -1054,7 +1056,7 @@ int64_t KYTY_SYSV_ABI KernelPwritev(int d, const KernelIovec* iov, int iovcnt, i
 	return bytes_written;
 }
 
-int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence) {
+static int64_t KernelLseekImpl(int d, int64_t offset, int whence) {
 	PRINT_NAME();
 
 	if (d < DESCRIPTOR_MIN) {
@@ -1118,7 +1120,7 @@ int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence) {
 	return static_cast<int64_t>(position);
 }
 
-int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
+static int KernelStatImpl(const char* path, FileStat* sb) {
 	PRINT_NAME();
 
 	if (path == nullptr || sb == nullptr) {
@@ -1165,7 +1167,7 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
+static int KernelFstatImpl(int d, FileStat* sb) {
 	PRINT_NAME();
 
 	if (d < DESCRIPTOR_MIN) {
@@ -1227,6 +1229,104 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 	*sb              = stat;
 
 	return OK;
+}
+
+// Debug (KYTY_DEBUG_FILE_FILTER=<text>): trace file calls on paths containing <text>.
+static const char* DebugTraceFilter() {
+	static const char* filter = [] {
+		const char* value = std::getenv("KYTY_DEBUG_FILE_FILTER");
+		return value != nullptr && value[0] != '\0' ? value : nullptr;
+	}();
+	return filter;
+}
+
+static bool DebugTraceName(const std::string& name) {
+	const char* filter = DebugTraceFilter();
+	return filter != nullptr && name.find(filter) != std::string::npos;
+}
+
+static std::string DebugTraceFd(int d) {
+	if (DebugTraceFilter() == nullptr || d < DESCRIPTOR_MIN || g_files == nullptr) {
+		return {};
+	}
+	auto* file = g_files->GetFile(d);
+	if (file == nullptr) {
+		return {};
+	}
+	auto name = Common::PathToString(file->real_name);
+	return DebugTraceName(name) ? name : std::string {};
+}
+
+int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
+	const auto result = KernelOpenImpl(path, flags, mode);
+	if (path != nullptr && DebugTraceName(path)) {
+		std::printf("FileTrace: open %s flags=0x%x -> %d\n", path, static_cast<uint32_t>(flags), result);
+	}
+	return result;
+}
+
+int KYTY_SYSV_ABI KernelClose(int d) {
+	const auto name   = DebugTraceFd(d);
+	const auto result = KernelCloseImpl(d);
+	if (!name.empty()) {
+		std::printf("FileTrace: close %d %s -> %d\n", d, name.c_str(), result);
+	}
+	return result;
+}
+
+int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
+	const auto result = KernelReadImpl(d, buf, nbytes);
+	if (const auto name = DebugTraceFd(d); !name.empty()) {
+		std::printf("FileTrace: read %d %s buf=%p n=0x%llx -> 0x%llx\n", d, name.c_str(), buf,
+		            static_cast<unsigned long long>(nbytes), static_cast<long long>(result));
+	}
+	return result;
+}
+
+int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offset) {
+	const auto result = KernelPreadImpl(d, buf, nbytes, offset);
+	if (const auto name = DebugTraceFd(d); !name.empty()) {
+		std::printf("FileTrace: pread %d %s buf=%p n=0x%llx off=0x%llx -> 0x%llx\n", d, name.c_str(),
+		            buf, static_cast<unsigned long long>(nbytes),
+		            static_cast<unsigned long long>(offset), static_cast<long long>(result));
+	}
+	return result;
+}
+
+int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, int64_t offset) {
+	const auto result = KernelPreadvImpl(d, iov, iovcnt, offset);
+	if (const auto name = DebugTraceFd(d); !name.empty()) {
+		std::printf("FileTrace: preadv %d %s iovcnt=%d off=0x%llx -> 0x%llx\n", d, name.c_str(),
+		            iovcnt, static_cast<unsigned long long>(offset), static_cast<long long>(result));
+	}
+	return result;
+}
+
+int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence) {
+	const auto result = KernelLseekImpl(d, offset, whence);
+	if (const auto name = DebugTraceFd(d); !name.empty()) {
+		std::printf("FileTrace: lseek %d %s off=0x%llx whence=%d -> 0x%llx\n", d, name.c_str(),
+		            static_cast<unsigned long long>(offset), whence, static_cast<long long>(result));
+	}
+	return result;
+}
+
+int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
+	const auto result = KernelStatImpl(path, sb);
+	if (path != nullptr && DebugTraceName(path)) {
+		std::printf("FileTrace: stat %s -> %d size=0x%llx\n", path, result,
+		            result == 0 && sb != nullptr ? static_cast<unsigned long long>(sb->st_size) : 0ull);
+	}
+	return result;
+}
+
+int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
+	const auto result = KernelFstatImpl(d, sb);
+	if (const auto name = DebugTraceFd(d); !name.empty()) {
+		std::printf("FileTrace: fstat %d %s -> %d size=0x%llx\n", d, name.c_str(), result,
+		            result == 0 && sb != nullptr ? static_cast<unsigned long long>(sb->st_size) : 0ull);
+	}
+	return result;
 }
 
 int KYTY_SYSV_ABI KernelFtruncate(int d, int64_t length) {

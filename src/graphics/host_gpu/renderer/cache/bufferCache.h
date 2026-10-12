@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/lruCache.h"
 #include "common/slotVector.h"
+#include "common/uniqueFunction.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
@@ -80,6 +81,10 @@ public:
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// GPU thread: copies the GPU-modified bytes of a guest-polled range back into the guest
+	// backing once the current submission completes, without waiting; `done` runs afterwards
+	// (or immediately when nothing needs copying).
+	void RefreshPolledRange(uint64_t vaddr, uint64_t size, Common::UniqueFunction<void>&& done);
 	// The caller published the GPU result to the guest backing itself; no download is needed.
 	void               DiscardGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
@@ -87,6 +92,8 @@ public:
 	void               RunGarbageCollector();
 	// Debug (KYTY_PERF_STATS): writable bindings recorded over [vaddr, vaddr + size).
 	[[nodiscard]] std::string DescribeWriters(uint64_t vaddr, uint64_t size) const;
+	// Debug (KYTY_PERF_STATS): GPU-modified byte ranges in [vaddr, vaddr + size), relative to vaddr.
+	[[nodiscard]] std::string DescribeGpuModified(uint64_t vaddr, uint64_t size);
 	// Debug (KYTY_PERF_STATS): the contiguous GPU-dirty run around vaddr, or {0, 0}.
 	[[nodiscard]] std::pair<uint64_t, uint64_t> GpuDirtyRun(uint64_t vaddr);
 

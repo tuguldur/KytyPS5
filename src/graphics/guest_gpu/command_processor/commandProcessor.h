@@ -6,8 +6,11 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -175,6 +178,20 @@ private:
 	uint32_t m_num_instances = 1;
 	// Instance count left in GPU-written indirect arguments; read only if a later draw uses it.
 	uint64_t m_num_instances_args_addr = 0;
+	// Single indexed indirect draws with GPU-written arguments, keyed by argument address. Once
+	// several CPU reads agree on every field but the instance count, mesh draws predict those
+	// fields and keep the instance count on the GPU. A failed check disables the address.
+	struct IndirectArgsPrediction {
+		std::array<uint32_t, 5> args {}; // guest DrawIndexedIndirectArgs layout
+		uint32_t                stable_reads    = 0;
+		uint32_t                max_instances   = 0;
+		// The index count toggles between 0 and 1; the GPU copies it into the task Z count.
+		bool                    index_count_gate = false;
+		bool                    not_mesh        = false;
+		bool                    gpu_args_failed = false;
+		std::atomic<bool>       failed {false};
+	};
+	std::unordered_map<uint64_t, IndirectArgsPrediction> m_indirect_predictions;
 
 	uint32_t m_de_count    = 0;
 	uint32_t m_ce_count    = 0;

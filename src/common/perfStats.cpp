@@ -27,7 +27,7 @@ constexpr std::array<const char*, static_cast<size_t>(Section::Count)> SectionNa
     "shader-compile", "pipeline-create", "srt-materialize", "gpu-process", "queue-submit",
     "present", "color-meta-readback", "gpu-wait", "sync-readback", "cp-flush", "draw-prepare",
     "draw-execute", "dispatch", "flush-slice", "readback-cpu-read",
-    "readback-cpu-write", "readback-indirect", "draw-indirect-gpu",
+    "readback-cpu-write", "readback-indirect", "draw-indirect-gpu", "emulated-load",
 };
 
 struct Counter {
@@ -126,6 +126,47 @@ void AddWaitSite(uint64_t nanos) {
 #else
 	(void)nanos;
 #endif
+}
+
+namespace {
+constexpr int                            FaultStackFrames = 8;
+thread_local std::array<uint64_t, FaultStackFrames> g_fault_stack {};
+thread_local int                         g_fault_stack_count = 0;
+} // namespace
+
+void CaptureFaultStack(void* native_context) {
+	g_fault_stack_count = 0;
+#if defined(_WIN32)
+	if (native_context == nullptr) {
+		return;
+	}
+	CONTEXT    context = *static_cast<const CONTEXT*>(native_context);
+	const auto base    = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+	for (int i = 0; i < FaultStackFrames && context.Rip != 0; i++) {
+		g_fault_stack[g_fault_stack_count++] = context.Rip >= base ? context.Rip - base : context.Rip;
+		DWORD64 image_base = 0;
+		auto*   function   = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
+		if (function == nullptr) {
+			break; // Guest or JIT code without unwind data.
+		}
+		void*   handler_data     = nullptr;
+		DWORD64 establisher_frame = 0;
+		RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context,
+		                 &handler_data, &establisher_frame, nullptr);
+	}
+#else
+	(void)native_context;
+#endif
+}
+
+std::string FaultStackText() {
+	std::string text;
+	for (int i = 0; i < g_fault_stack_count; i++) {
+		char frame[24];
+		std::snprintf(frame, sizeof(frame), " +0x%llx", static_cast<unsigned long long>(g_fault_stack[i]));
+		text += frame;
+	}
+	return text;
 }
 
 void FramePresented() {

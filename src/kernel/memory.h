@@ -126,6 +126,8 @@ void                   DebugRecordFileData(uint64_t vaddr, uint64_t size, const 
 void                   DebugForgetFileData(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+// Guest load from a GPU-written range the guest polls; see RenderContext::TryServePolledRead.
+[[nodiscard]] bool TryServePolledGpuRead(uint64_t vaddr, void* data, uint64_t size) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);

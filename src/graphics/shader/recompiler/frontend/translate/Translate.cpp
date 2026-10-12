@@ -1275,30 +1275,67 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 					first = entry_ir.IAdd(first, parity);
 					second = entry_ir.ISub(second, parity);
 				}
+				const auto index_bytes  = draw(3);
+				const auto indexed      = entry_ir.INotEqual(index_bytes, u32(0));
+				const auto index_low    = draw(4);
+				const auto index_resource = entry_ir.Emit(
+				    IR::ValueOpcode::GetAddressResource,
+				    {entry_ir.BitwiseAnd(index_low, u32(~3u)), draw(5)});
+				// Reads the guest index of input vertex `input` (relative to the draw).
+				const auto load_index = [&](IR::U32 input, IR::U1 condition) {
+					const auto byte_offset = entry_ir.IAdd(entry_ir.BitwiseAnd(index_low, u32(3)),
+					                                       entry_ir.IMul(input, index_bytes));
+					const auto memory_index = static_cast<uint32_t>(result.memory_info.size());
+					result.memory_info.push_back({.kind = IR::ResourceKind::Global});
+					const auto packed_index = entry_ir.Emit(
+					    IR::ValueOpcode::LoadAddressU32,
+					    {index_resource, entry_ir.BitwiseAnd(byte_offset, u32(~3u)), u32(0),
+					     condition},
+					    IR::MemoryFlags {.index = memory_index});
+					return IR::U32(entry_ir.Emit(
+					    IR::ValueOpcode::BitFieldUExtract,
+					    {packed_index,
+					     entry_ir.IMul(entry_ir.BitwiseAnd(byte_offset, u32(3)), u32(8)),
+					     entry_ir.IMul(index_bytes, u32(8))}));
+				};
+				auto index = load_index(input_vertex,
+				                        entry_ir.LogicalAnd(indexed, entry_ir.ULessThan(local, vertices)));
+				if (mesh.primitive_restart != 0u) {
+					// Native primitive restart: the reset index is all ones for the index size.
+					// A restart vertex fetches the base vertex instead of reading past the vertex
+					// buffer, and every primitive using one collapses to a single vertex, which
+					// the rasterizer discards. Strip winding is not reset after a restart.
+					const auto restart_value = entry_ir.Select(
+					    entry_ir.IEqual(index_bytes, u32(2)), u32(0xffffu),
+					    entry_ir.Select(entry_ir.IEqual(index_bytes, u32(1)), u32(0xffu),
+					                    u32(0xffffffffu)));
+					const auto is_restart = [&](IR::U32 value) {
+						return entry_ir.LogicalAnd(indexed, entry_ir.IEqual(value, restart_value));
+					};
+					index = entry_ir.Select(is_restart(index), u32(0), index);
+					const auto fan = mesh.input_primitive ==
+					                 static_cast<uint32_t>(Prospero::PrimitiveType::kTriFan);
+					const auto global = [&](IR::U32 vertex_id, bool center) {
+						return center ? u32(0) : entry_ir.IAdd(chunk, vertex_id);
+					};
+					const auto primitive_lane =
+					    entry_ir.LogicalAnd(indexed, entry_ir.ULessThan(local, primitives));
+					auto restart_primitive =
+					    entry_ir.LogicalOr(is_restart(load_index(global(first, fan), primitive_lane)),
+					                       is_restart(load_index(global(second, false), primitive_lane)));
+					if (mesh.InputPrimitiveSize() == 3u) {
+						restart_primitive = entry_ir.LogicalOr(
+						    restart_primitive,
+						    is_restart(load_index(global(third, false), primitive_lane)));
+					}
+					second = entry_ir.Select(restart_primitive, first, second);
+					third  = entry_ir.Select(restart_primitive, first, third);
+				}
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(0),
 				                      entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(first, u32(2)),
 				                                         entry_ir.ShiftLeftLogical(second, u32(18))));
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(1),
 				                      entry_ir.ShiftLeftLogical(third, u32(2)));
-				const auto index_bytes  = draw(3);
-				const auto indexed      = entry_ir.INotEqual(index_bytes, u32(0));
-				const auto index_low    = draw(4);
-				const auto byte_offset  = entry_ir.IAdd(entry_ir.BitwiseAnd(index_low, u32(3)),
-				                                           entry_ir.IMul(input_vertex, index_bytes));
-				const auto index_resource = entry_ir.Emit(
-				    IR::ValueOpcode::GetAddressResource,
-				    {entry_ir.BitwiseAnd(index_low, u32(~3u)), draw(5)});
-				const auto memory_index = static_cast<uint32_t>(result.memory_info.size());
-				result.memory_info.push_back({.kind = IR::ResourceKind::Global});
-				const auto packed_index = entry_ir.Emit(
-				    IR::ValueOpcode::LoadAddressU32,
-				    {index_resource, entry_ir.BitwiseAnd(byte_offset, u32(~3u)), u32(0),
-				     entry_ir.LogicalAnd(indexed, entry_ir.ULessThan(local, vertices))},
-				    IR::MemoryFlags {.index = memory_index});
-				const auto index = IR::U32(entry_ir.Emit(
-				    IR::ValueOpcode::BitFieldUExtract,
-				    {packed_index, entry_ir.IMul(entry_ir.BitwiseAnd(byte_offset, u32(3)), u32(8)),
-				     entry_ir.IMul(index_bytes, u32(8))}));
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
 				                      entry_ir.IAdd(draw(1), entry_ir.Select(indexed, index, input_vertex)));
 				entry_ir.SetVectorReg(

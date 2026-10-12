@@ -31,6 +31,7 @@ enum class Section : uint32_t {
 	ReadbackCpuWrite,  // guest CPU write to GPU-written memory (page fault)
 	ReadbackIndirect,  // indirect dispatch arguments read back on the CPU
 	DrawIndirectGpu,   // indexed indirect draws whose GPU-written arguments stay on the GPU
+	EmulatedLoad,      // GPU-thread loads from protected pages served without a GPU drain
 	Count
 };
 
@@ -38,6 +39,9 @@ bool Enabled();
 void Add(Section section, uint64_t nanos);
 // Attributes a wait to its call stack; the slowest sites are printed with the summary.
 void AddWaitSite(uint64_t nanos);
+// Records the host call stack (module offsets) of the access fault being handled on this thread.
+void        CaptureFaultStack(void* native_context);
+std::string FaultStackText();
 // Called once per presented guest frame; prints the summary when the interval elapses.
 void FramePresented();
 

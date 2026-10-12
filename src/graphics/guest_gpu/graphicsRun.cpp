@@ -962,22 +962,60 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 	// Arguments a compute shader just wrote stay on the GPU: reading them here would stall
 	// recording until the GPU drains. Only single draws whose arguments feed no SGPRs qualify.
-	if (indexed && draw_count == 1 && count_addr == nullptr && index_size != 1 &&
+	const bool single_gpu_draw =
+	    indexed && draw_count == 1 && count_addr == nullptr && index_size != 1 &&
 	    m_index_buffer_size != 0 && registers.vertex_offset == Pm4::SH_NOP &&
-	    registers.instance_offset == Pm4::SH_NOP && registers.index_offset == Pm4::SH_NOP) {
-		const auto args_addr = m_draw_indirect_args_base_addr + data_offset;
-		if (m_renderer.GetBufferCache().IsRegionGpuModified(args_addr,
-		                                                    sizeof(DrawIndexedIndirectArgs)) &&
-		    m_renderer.GetRenderExecutor().DrawIndex(
-		        m_submit_id, CurrentBuffer(),
-		        {.index_count         = m_index_buffer_size,
-		         .index_addr          = reinterpret_cast<const void*>(m_index_base_addr),
-		         .instance_count      = 1,
-		         .index_type_and_size = m_index_type_and_size,
-		         .offset_source       = DrawOffsetSource::IndirectArgs,
-		         .indirect_args_addr  = args_addr})) {
-			m_num_instances_args_addr = args_addr;
-			return;
+	    registers.instance_offset == Pm4::SH_NOP && registers.index_offset == Pm4::SH_NOP;
+	if (single_gpu_draw) {
+		constexpr uint32_t PredictionReads = 3;
+		const auto         args_addr       = m_draw_indirect_args_base_addr + data_offset;
+		// Predict regardless of the dirty state: shaders often write the arguments through BDA,
+		// which the tracker only learns about after the GPU runs. The GPU copy of the arguments
+		// reads the host buffer, which holds both GPU writes and uploaded CPU writes.
+		auto& prediction = m_indirect_predictions[args_addr];
+		if (!prediction.not_mesh && prediction.stable_reads >= PredictionReads &&
+		    prediction.max_instances != 0 && !prediction.failed.load(std::memory_order_relaxed)) {
+			// An index count of 0 or 1 is gated on the GPU, so predict 1 and let the GPU skip.
+			auto       predicted = prediction.args;
+			const bool gate      = predicted[0] <= 1u;
+			if (gate) {
+				predicted[0] = 1u;
+			}
+			if (m_renderer.GetRenderExecutor().DrawIndex(
+			        m_submit_id, CurrentBuffer(),
+			        {.index_count    = std::min(predicted[0], m_index_buffer_size),
+			         .index_addr     = reinterpret_cast<const void*>(
+			             m_index_base_addr + static_cast<uint64_t>(predicted[2]) * index_size),
+			         .instance_count = prediction.max_instances,
+			         .index_type_and_size     = m_index_type_and_size,
+			         .base_vertex             = static_cast<int32_t>(predicted[3]),
+			         .first_instance          = predicted[4],
+			         .offset_source           = DrawOffsetSource::IndirectArgs,
+			         .mesh_instance_args_addr = args_addr,
+			         .mesh_prediction_failed  = &prediction.failed,
+			         .mesh_predicted_args     = predicted,
+			         .mesh_index_count_gate   = gate})) {
+				m_num_instances_args_addr = args_addr;
+				return;
+			}
+			prediction.not_mesh = true;
+		}
+		if (!prediction.gpu_args_failed &&
+		    m_renderer.GetBufferCache().IsRegionGpuModified(args_addr,
+		                                                    sizeof(DrawIndexedIndirectArgs))) {
+			if (m_renderer.GetRenderExecutor().DrawIndex(
+			        m_submit_id, CurrentBuffer(),
+			        {.index_count         = m_index_buffer_size,
+			         .index_addr          = reinterpret_cast<const void*>(m_index_base_addr),
+			         .instance_count      = 1,
+			         .index_type_and_size = m_index_type_and_size,
+			         .offset_source       = DrawOffsetSource::IndirectArgs,
+			         .indirect_args_addr  = args_addr})) {
+				m_num_instances_args_addr = args_addr;
+				return;
+			}
+			// Mesh, quad-list and depth-copy draws size the draw on the CPU.
+			prediction.gpu_args_failed = true;
 		}
 	}
 
@@ -1004,16 +1042,57 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 			static std::atomic<uint32_t> logged {0};
 			const auto index = logged.fetch_add(1, std::memory_order_relaxed);
 			if (index < 30 || index % 500 == 0) {
+				const auto found = m_indirect_predictions.find(args_addr);
+				const bool known = found != m_indirect_predictions.end();
 				std::printf("IndirectDraw #%u: draws=%u/%u count_addr=%d stride=%u regs(vtx=0x%x "
 				            "inst=0x%x idx=0x%x) args=0x%llx idx_count=%u inst=%u first_idx=%u "
-				            "base_vtx=%d first_inst=%u ib_size=%u\n",
+				            "base_vtx=%d first_inst=%u ib_size=%u elem=%llu single=%d dirty=%d "
+				            "predict(known=%d reads=%u max=%u not_mesh=%d gpu_failed=%d failed=%d)\n",
 				            index, i, draw_count, count_addr != nullptr ? 1 : 0, stride_in_bytes,
 				            registers.vertex_offset, registers.instance_offset,
 				            registers.index_offset, static_cast<unsigned long long>(args_addr),
 				            args->index_count_per_instance, args->instance_count,
 				            args->start_index_location,
 				            static_cast<int32_t>(args->base_vertex_location),
-				            args->start_instance_location, m_index_buffer_size);
+				            args->start_instance_location, m_index_buffer_size,
+				            static_cast<unsigned long long>(index_size), single_gpu_draw ? 1 : 0,
+				            m_renderer.GetBufferCache().IsRegionGpuModified(
+				                args_addr, sizeof(DrawIndexedIndirectArgs))
+				                ? 1
+				                : 0,
+				            known ? 1 : 0, known ? found->second.stable_reads : 0u,
+				            known ? found->second.max_instances : 0u,
+				            known && found->second.not_mesh ? 1 : 0,
+				            known && found->second.gpu_args_failed ? 1 : 0,
+				            known && found->second.failed.load() ? 1 : 0);
+			}
+		}
+		if (single_gpu_draw) {
+			if (auto found = m_indirect_predictions.find(args_addr);
+			    found != m_indirect_predictions.end()) {
+				auto&                         prediction = found->second;
+				const std::array<uint32_t, 5> seen {
+				    args->index_count_per_instance, args->instance_count, args->start_index_location,
+				    static_cast<uint32_t>(args->base_vertex_location), args->start_instance_location};
+				// An index count switching between 0 and 1 is still predictable (see
+				// IndirectArgsPrediction::index_count_gate).
+				const bool index_count_match =
+				    seen[0] == prediction.args[0] || (seen[0] <= 1u && prediction.args[0] <= 1u);
+				if (prediction.stable_reads != 0 && index_count_match &&
+				    seen[2] == prediction.args[2] && seen[3] == prediction.args[3] &&
+				    seen[4] == prediction.args[4]) {
+					prediction.stable_reads++;
+					if (seen[0] != prediction.args[0]) {
+						prediction.index_count_gate = true;
+						prediction.args[0]          = 1u;
+					}
+				} else {
+					prediction.args             = seen;
+					prediction.stable_reads     = 1;
+					prediction.max_instances    = 0;
+					prediction.index_count_gate = false;
+				}
+				prediction.max_instances = std::max(prediction.max_instances, seen[1]);
 			}
 		}
 		PatchIndirectDrawOffsets(*this, registers, args->base_vertex_location,

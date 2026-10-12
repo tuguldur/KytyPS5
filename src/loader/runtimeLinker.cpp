@@ -6,12 +6,14 @@
 #include "common/file.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/platform/sysDbg.h"
 #include "common/profiler.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
@@ -647,6 +649,166 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Loads that fault on GPU-tracked pages, emulated instead of draining the GPU:
+// - GPU thread: the faulting load usually reads bytes the GPU never wrote; the whole page is
+//   protected because other bytes in it are GPU-modified. The buffer cache read only
+//   synchronizes when the loaded bytes themselves are GPU-modified. (The SRT walker JIT emits
+//   plain `mov reg, [base + disp]` loads.)
+// - Guest threads: only loads from a range the guest keeps polling, served from the backing while
+//   the GPU thread refreshes it asynchronously (RenderContext::TryServePolledRead).
+// The page stays protected either way. Unsupported encodings fall back to the normal fault path.
+struct DecodedLoad {
+	uint32_t reg    = 0;
+	uint32_t length = 0;
+	uint64_t width  = 0;
+	uint64_t address = 0;
+	bool     xmm    = false;
+	bool     vex    = false;
+};
+
+static bool DecodeModRmAddress(const CONTEXT& context, const uint8_t* code, uint32_t& length,
+                               bool rex_b, uint64_t& address, uint32_t& reg_field) {
+	const uint8_t  modrm = code[length];
+	const uint32_t mod   = modrm >> 6u;
+	const uint32_t rm    = modrm & 7u;
+	if (mod == 3u || rm == 4u || (mod == 0u && rm == 5u)) { // register, SIB or RIP-relative
+		return false;
+	}
+	reg_field = (modrm >> 3u) & 7u;
+	length += 1;
+	int64_t disp = 0;
+	if (mod == 1u) {
+		disp = static_cast<int8_t>(code[length]);
+		length += 1;
+	} else if (mod == 2u) {
+		int32_t disp32 = 0;
+		std::memcpy(&disp32, code + length, sizeof(disp32));
+		disp = disp32;
+		length += 4;
+	}
+	// CONTEXT stores RAX..R15 contiguously in register-encoding order.
+	const auto* regs = &context.Rax;
+	address          = regs[rm | (rex_b ? 8u : 0u)] + static_cast<uint64_t>(disp);
+	return true;
+}
+
+static bool DecodeLoad(const CONTEXT& context, DecodedLoad& load) {
+	const auto* code      = reinterpret_cast<const uint8_t*>(context.Rip);
+	uint32_t    length    = 0;
+	uint32_t    reg_field = 0;
+	if (code[0] == 0xc5u || code[0] == 0xc4u) {
+		// VEX vmovss/vmovsd xmm, m32/m64 (map 0F, opcode 10, vvvv = 1111).
+		const bool    three = code[0] == 0xc4u;
+		const uint8_t last  = three ? code[2] : code[1];
+		const bool    rex_r = (code[1] & 0x80u) == 0;
+		const bool    rex_b = three && (code[1] & 0x20u) == 0;
+		const bool    rex_x = three && (code[1] & 0x40u) == 0;
+		const auto    pp    = last & 3u;
+		if ((three && (code[1] & 0x1fu) != 1u) || ((last >> 3u) & 0xfu) != 0xfu || rex_x ||
+		    (pp != 2u && pp != 3u)) {
+			return false;
+		}
+		length = three ? 3u : 2u;
+		if (code[length] != 0x10u) {
+			return false;
+		}
+		length += 1;
+		if (!DecodeModRmAddress(context, code, length, rex_b, load.address, reg_field)) {
+			return false;
+		}
+		load.reg   = reg_field | (rex_r ? 8u : 0u);
+		load.width = pp == 2u ? 4u : 8u;
+		load.xmm   = true;
+		load.vex   = true;
+	} else {
+		uint8_t legacy = 0;
+		if (code[0] == 0xf3u || code[0] == 0xf2u) { // movss/movsd xmm, m32/m64
+			legacy = code[0];
+			length = 1;
+		}
+		uint8_t rex = 0;
+		if ((code[length] & 0xf0u) == 0x40u) {
+			rex = code[length];
+			length += 1;
+		}
+		if (legacy != 0) {
+			if (code[length] != 0x0fu || code[length + 1] != 0x10u || (rex & 0x8u) != 0) {
+				return false;
+			}
+			length += 2;
+			load.width = legacy == 0xf3u ? 4u : 8u;
+			load.xmm   = true;
+		} else {
+			if (code[length] != 0x8bu) { // mov r32/r64, r/m32/r/m64
+				return false;
+			}
+			length += 1;
+			load.width = (rex & 0x8u) != 0 ? 8u : 4u;
+		}
+		if (!DecodeModRmAddress(context, code, length, (rex & 0x1u) != 0, load.address,
+		                        reg_field)) {
+			return false;
+		}
+		load.reg = reg_field | ((rex & 0x4u) != 0 ? 8u : 0u);
+	}
+	load.length = length;
+	return true;
+}
+
+static bool TryEmulateGpuMemoryLoad(void* native_context, uint64_t fault_vaddr) {
+	if (native_context == nullptr) {
+		return false;
+	}
+	auto&       context = *static_cast<CONTEXT*>(native_context);
+	DecodedLoad load;
+	if (!DecodeLoad(context, load) || fault_vaddr < load.address ||
+	    fault_vaddr - load.address >= load.width) {
+		return false;
+	}
+	M128A* upper = nullptr;
+	if (load.xmm) {
+		if ((context.ContextFlags & CONTEXT_FLOATING_POINT) != CONTEXT_FLOATING_POINT) {
+			return false;
+		}
+		if (load.vex) {
+			// VEX loads clear bits 255:128; that state lives in the extended context.
+			DWORD64 features = 0;
+			DWORD   size     = 0;
+			if ((context.ContextFlags & CONTEXT_XSTATE) != CONTEXT_XSTATE ||
+			    GetXStateFeaturesMask(&context, &features) == FALSE ||
+			    (features & XSTATE_MASK_AVX) == 0 ||
+			    (upper = static_cast<M128A*>(LocateXStateFeature(&context, XSTATE_AVX, &size))) ==
+			        nullptr ||
+			    size < 16u * sizeof(M128A)) {
+				return false;
+			}
+		}
+	}
+	uint64_t value = 0;
+	if (Libs::Graphics::GuestGpu::IsGpuThread()) {
+		KYTY_PERF_SCOPE(EmulatedLoad);
+		if (!Libs::LibKernel::Memory::TryReadBufferBacking(load.address, &value, load.width)) {
+			return false;
+		}
+	} else if (!Libs::LibKernel::Memory::TryServePolledGpuRead(load.address, &value, load.width)) {
+		return false;
+	}
+	if (load.xmm) {
+		auto& xmm = context.FltSave.XmmRegisters[load.reg];
+		xmm.Low   = value; // Scalar loads clear the rest of the register.
+		xmm.High  = 0;
+		if (upper != nullptr) {
+			upper[load.reg] = {};
+		}
+	} else {
+		(&context.Rax)[load.reg] = value; // A 32-bit load zero-extends.
+	}
+	context.Rip += load.length;
+	return true;
+}
+#endif
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -664,6 +826,15 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Write: access = GpuAccess::Write; break;
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
+		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (access == GpuAccess::Read &&
+		    TryEmulateGpuMemoryLoad(info->native_context, info->access_violation_vaddr)) {
+			return true;
+		}
+#endif
+		if (PerfStats::Enabled()) {
+			PerfStats::CaptureFaultStack(info->native_context);
 		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			return true;

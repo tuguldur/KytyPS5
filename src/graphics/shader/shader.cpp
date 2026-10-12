@@ -15,12 +15,14 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
 #include <atomic>
 #include <bit>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -346,8 +348,21 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 
 	const bool debug_dump = Config::GraphicsDebugDumpEnabled();
 
+	// The tables can share a page with GPU-written data. Read them through the buffer cache,
+	// which only synchronizes with the GPU when these exact bytes are GPU-modified, instead of
+	// faulting on the page and downloading everything the GPU wrote there.
+	const auto read_table = [](const uint32_t* address, uint32_t* out, uint32_t count) {
+		const auto bytes = static_cast<uint64_t>(count) * sizeof(uint32_t);
+		if (!LibKernel::Memory::TryReadBufferBacking(reinterpret_cast<uint64_t>(address), out,
+		                                             bytes)) {
+			std::memcpy(out, address, bytes);
+		}
+	};
+
 	for (uint32_t i = 0; i < input_semantics.size(); i++) {
 		const auto& in = input_semantics[i];
+		uint32_t    attribute = 0;
+		read_table(attrib + in.semantic, &attribute, 1);
 
 		EXIT_NOT_IMPLEMENTED(in.static_vb_index == 1 || in.static_attribute == 1);
 
@@ -356,18 +371,19 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 
 		if (debug_dump) {
 			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i,
-			     attrib[in.semantic]);
+			     attribute);
 		}
 
-		size_t index = attrib[in.semantic] & 0x1fu;
+		size_t index = attribute & 0x1fu;
 		auto   format =
-		    static_cast<Prospero::VertexAttribFormat>((attrib[in.semantic] >> 5u) & 0x1ffu);
-		uint32_t offset      = (attrib[in.semantic] >> 14u) & 0xfffu;
-		uint32_t fetch_index = (attrib[in.semantic] >> 26u) & 0x1u;
+		    static_cast<Prospero::VertexAttribFormat>((attribute >> 5u) & 0x1ffu);
+		uint32_t offset      = (attribute >> 14u) & 0xfffu;
+		uint32_t fetch_index = (attribute >> 26u) & 0x1u;
 
 		EXIT_NOT_IMPLEMENTED(index >= ShaderVertexInputInfo::RES_MAX);
 
-		const auto* sharp = &buffer[index * 4];
+		uint32_t sharp[4] {};
+		read_table(buffer + index * 4, sharp, 4);
 
 		EXIT_NOT_IMPLEMENTED(info.resources_num >= ShaderVertexInputInfo::RES_MAX);
 
@@ -629,7 +645,7 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		                       mesh.scratch_size_dwords, mesh.input_primitive,
 		                       mesh.primitives_per_group, mesh.vertices_per_group,
 		                       mesh.max_vertices, mesh.max_primitives, mesh.provoking_vertex,
-		                       static_cast<uint32_t>(mesh.fast_launch)});
+		                       static_cast<uint32_t>(mesh.fast_launch), mesh.primitive_restart});
 	}
 	key.push_back(info.tess.input_control_points);
 	if (info.tess.input_control_points != 0) {
@@ -734,6 +750,16 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	mesh.wave_size           = (context.GetShaderStages() & 0x00400000u) != 0 ? 32u : 64u;
 	mesh.max_vertices        = sh.m_geMaxOutputPerSubgroup;
 	mesh.provoking_vertex    = context.GetModeControl().provoking_vtx_last ? 2u : 0u;
+	{
+		const auto prim  = user_config.GetPrimType();
+		const bool strip = prim == Prospero::PrimitiveType::kLineStrip ||
+		                   prim == Prospero::PrimitiveType::kTriStrip ||
+		                   prim == Prospero::PrimitiveType::kTriFan;
+		mesh.primitive_restart = strip && (user_config.GetPrimitiveResetControl() & 1u) != 0 &&
+		                                 (context.GetPrimitiveResetIndex() & 0xffffu) == 0xffffu
+		                             ? 1u
+		                             : 0u;
+	}
 	mesh.lds_size_dwords     = static_cast<uint32_t>(regs.gs_regs.rsrc2.lds_size) * 128u;
 	mesh.scratch_size_dwords = data.scratch_size_dwords;
 	const auto fast_launch = (context.GetShaderStages() >> 19u) & 3u;

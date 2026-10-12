@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <atomic>
 #include <optional>
 #include <span>
 #include <vector>
@@ -60,6 +61,15 @@ struct DrawIndexArgs {
 	// Guest address of GPU-written DrawIndexedIndirectArgs the host draw reads on the GPU. The
 	// index range then covers INDEX_BUFFER_SIZE and the counts above are upper bounds only.
 	uint64_t         indirect_args_addr         = 0;
+	// Mesh draws only: guest address of GPU-written DrawIndexedIndirectArgs whose instance count
+	// the host draw reads on the GPU. The counts and offsets above were predicted from earlier
+	// CPU reads (`mesh_predicted_args`, in guest layout); they are compared with the real
+	// arguments once the GPU has run, and `mesh_prediction_failed` is set on a mismatch.
+	uint64_t                 mesh_instance_args_addr = 0;
+	std::atomic<bool>*       mesh_prediction_failed  = nullptr;
+	std::array<uint32_t, 5>  mesh_predicted_args {};
+	// The index count is 0 or 1: the GPU copies it into the task Z count to skip empty draws.
+	bool                     mesh_index_count_gate = false;
 };
 
 struct DrawAutoArgs {

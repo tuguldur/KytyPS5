@@ -38,6 +38,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -1035,6 +1036,84 @@ static void PrepareGpuIndirectArgs(CommandBuffer& buffer, uint64_t args_addr, bo
 	emit.indirect_offset = slot_offset;
 }
 
+// Builds the mesh task command of a draw whose other arguments were predicted on the CPU: the
+// instance count, the only field expected to vary, is copied from the GPU-written guest
+// arguments into the task command's Y group count. The full arguments are also copied back and
+// compared once the GPU has run; a mismatch disables the prediction for that address.
+static void PrepareGpuMeshTaskArgs(CommandBuffer& buffer, const DrawIndexArgs& args,
+                                   uint32_t mesh_groups, DrawEmitInfo& emit) {
+	static_assert(sizeof(vk::DrawMeshTasksIndirectCommandEXT) == 12);
+	static_assert(sizeof(vk::DrawIndexedIndirectCommand) == 20);
+	constexpr uint64_t ArgsSize          = sizeof(vk::DrawIndexedIndirectCommand);
+	constexpr uint64_t InstanceOffset    = sizeof(uint32_t); // instanceCount
+	constexpr uint64_t GroupCountYOffset = sizeof(uint32_t); // groupCountY
+	auto&              context           = buffer.GetContext();
+	auto&              cache             = context.GetBufferCache();
+	buffer.EndRendering();
+	const auto [args_buffer, args_offset] =
+	    cache.ObtainBuffer(args.mesh_instance_args_addr, ArgsSize, false);
+	EXIT_IF(args_buffer == nullptr);
+	auto& stream             = cache.GetUtilityBuffer(MemoryUsage::Stream);
+	auto [slot, slot_offset] = stream.Map(sizeof(vk::DrawMeshTasksIndirectCommandEXT), 16);
+	EXIT_IF(slot == nullptr);
+	const vk::DrawMeshTasksIndirectCommandEXT command {mesh_groups, 0, 1};
+	std::memcpy(slot, &command, sizeof(command));
+	stream.Commit();
+	auto& readback               = cache.GetUtilityBuffer(MemoryUsage::Download);
+	auto [check, check_offset]   = readback.Map(ArgsSize, 16);
+	EXIT_IF(check == nullptr);
+	readback.Commit();
+
+	const auto        native = buffer.Handle();
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
+	                       nullptr);
+	const vk::BufferCopy instances {args_offset + InstanceOffset, slot_offset + GroupCountYOffset,
+	                                sizeof(uint32_t)};
+	native.copyBuffer(args_buffer->Handle(), stream.Handle(), 1, &instances);
+	if (args.mesh_index_count_gate) {
+		// An index count of 0 or 1 becomes the Z group count: 0 skips the draw, 1 keeps it.
+		const vk::BufferCopy index_count {args_offset, slot_offset + 2u * sizeof(uint32_t),
+		                                  sizeof(uint32_t)};
+		native.copyBuffer(args_buffer->Handle(), stream.Handle(), 1, &index_count);
+	}
+	const vk::BufferCopy whole {args_offset, check_offset, ArgsSize};
+	native.copyBuffer(args_buffer->Handle(), readback.Handle(), 1, &whole);
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead | vk::AccessFlagBits::eHostRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eDrawIndirect |
+	                           vk::PipelineStageFlagBits::eHost,
+	                       {}, 1, &after, 0, nullptr, 0, nullptr);
+	emit.indirect_buffer = stream.Handle();
+	emit.indirect_offset = slot_offset;
+
+	context.GetCommandScheduler().DeferOperation(
+	    [&readback, check, check_offset, expected = args.mesh_predicted_args,
+	     failed = args.mesh_prediction_failed, address = args.mesh_instance_args_addr,
+	     gate = args.mesh_index_count_gate] {
+		    readback.Invalidate(check_offset, ArgsSize);
+		    std::array<uint32_t, 5> actual {};
+		    std::memcpy(actual.data(), check, ArgsSize);
+		    const bool index_count_ok =
+		        actual[0] == expected[0] || (gate && actual[0] == 0u);
+		    if (index_count_ok && actual[2] == expected[2] && actual[3] == expected[3] &&
+		        actual[4] == expected[4]) {
+			    return;
+		    }
+		    failed->store(true, std::memory_order_relaxed);
+		    std::printf("MeshIndirect: prediction failed at 0x%llx (index_count %u/%u, first_index "
+		                "%u/%u, base_vertex %u/%u, first_instance %u/%u); reading these "
+		                "arguments on the CPU from now on\n",
+		                static_cast<unsigned long long>(address), actual[0], expected[0],
+		                actual[2], expected[2], actual[3], expected[3], actual[4], expected[4]);
+	    });
+}
+
 static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_buffer,
                                const DrawCallInfo& draw, const DrawEmitInfo& emit) {
 	switch (ucfg.GetPrimType()) {
@@ -1150,9 +1229,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		EXIT_NOT_IMPLEMENTED(mesh.fast_launch && (draw.IsIndexed() || primitive_restart_enable));
 		static std::atomic_bool restart_warned = false;
 		if (primitive_restart_enable && !restart_warned.exchange(true, std::memory_order_relaxed)) {
-			std::printf("Warning: primitive restart is not implemented for mesh shaders; "
-			            "continuing draw (primitive=%u indexed=%u)\n",
+			std::printf("Info: mesh primitive restart drops restart primitives (strip winding is not "
+			            "reset; primitive=%u indexed=%u)\n",
 			            static_cast<uint32_t>(ucfg.GetPrimType()), draw.IsIndexed());
+		}
+		// Debug (KYTY_DEBUG_SKIP_RESTART_MESH=1): skip mesh draws with primitive restart.
+		static const bool skip_restart = [] {
+			const char* value = std::getenv("KYTY_DEBUG_SKIP_RESTART_MESH");
+			return value != nullptr && value[0] == '1';
+		}();
+		if (skip_restart && primitive_restart_enable) {
+			return;
 		}
 		if (mesh.primitives_per_group == 0) {
 			EXIT("unsupported mesh draw: primitive=%u indexed=%u restart=%u\n",
@@ -1257,7 +1344,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
-	if (mesh_active) {
+	if (mesh_active && emit.indirect_buffer) {
+		// Predicted indirect arguments: the instance count is read from the GPU-written guest
+		// arguments (see PrepareGpuMeshTaskArgs); draw.instance_count was only an upper bound.
+		vk_buffer.drawMeshTasksIndirectEXT(emit.indirect_buffer, emit.indirect_offset, 1,
+		                                   sizeof(vk::DrawMeshTasksIndirectCommandEXT));
+	} else if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
@@ -1390,6 +1482,11 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		ResetBindings();
 		return false;
 	}
+	const bool mesh_prediction = args.mesh_instance_args_addr != 0;
+	if (mesh_prediction && state.vertex_info[0].stage.program->stage != ShaderType::Mesh) {
+		ResetBindings();
+		return false;
+	}
 
 	const bool indirect = args.offset_source == DrawOffsetSource::IndirectArgs;
 	const auto [vertex_offset, instance_offset] =
@@ -1404,6 +1501,15 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	if (gpu_args) {
 		KYTY_PERF_SCOPE(DrawIndirectGpu);
 		PrepareGpuIndirectArgs(buffer, args.indirect_args_addr, native_indirect, emit);
+	}
+	if (mesh_prediction) {
+		KYTY_PERF_SCOPE(DrawIndirectGpu);
+		const auto& mesh       = state.vertex_info[0].mesh;
+		const auto  primitives = mesh.InputPrimitiveCount(draw.index_count);
+		if (primitives != 0 && mesh.primitives_per_group != 0) {
+			PrepareGpuMeshTaskArgs(buffer, args, (primitives - 1u) / mesh.primitives_per_group + 1u,
+			                       emit);
+		}
 	}
 
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,

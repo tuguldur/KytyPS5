@@ -6,12 +6,14 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/presentation/videoOut.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
 namespace Libs::Graphics {
 
@@ -121,16 +123,79 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 				const auto [start, end] = m_buffer_cache.GpuDirtyRun(fault_vaddr);
 				const bool gpu_thread   = GuestGpu::IsGpuThread();
 				const auto header       = gpu_thread ? GuestGpu::CurrentPm4Header() : 0u;
+				// The byte-exact GPU-modified ranges belong to the GPU thread.
+				const auto page  = fault_vaddr & ~uint64_t {0xfff};
+				bool        exact = false;
+				std::string ranges;
+				std::string writers;
+				const auto describe = [&] {
+					exact   = m_buffer_cache.HasGpuDirtyBytes(fault_vaddr, 8);
+					ranges  = m_buffer_cache.DescribeGpuModified(page, 0x1000);
+					writers = m_buffer_cache.DescribeWriters(page, 0x1000);
+				};
+				if (gpu_thread) {
+					describe();
+				} else {
+					GetGpu().SendCommandSync(describe);
+				}
 				std::printf("CpuReadFault #%u: %s pm4_op=0x%02x pm4_r=0x%02x addr=0x%llx "
-				            "dirty_run=0x%llx+0x%llx\n",
+				            "dirty_run=0x%llx+0x%llx exact=%d page_gpu_bytes:%s writers:%s "
+				            "stack:%s\n",
 				            index, gpu_thread ? "gpu-thread" : "guest-thread",
 				            (header >> 8u) & 0xffu, static_cast<uint32_t>(KYTY_PM4_R(header)),
 				            static_cast<unsigned long long>(fault_vaddr),
 				            static_cast<unsigned long long>(start),
-				            static_cast<unsigned long long>(end - start));
+				            static_cast<unsigned long long>(end - start), exact ? 1 : 0,
+				            ranges.c_str(), writers.c_str(), PerfStats::FaultStackText().c_str());
 			}
 		}
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
+	}
+	return true;
+}
+
+bool RenderContext::TryServePolledRead(uint64_t vaddr, void* data, uint64_t size) noexcept {
+	constexpr uint32_t PolledThreshold = 64;
+	constexpr uint64_t PolledMaxSize   = 16;
+	if (GuestGpu::IsGpuThread() || size == 0 || size > PolledMaxSize || !IsMapped(vaddr, size)) {
+		return false;
+	}
+	PolledRange* range = nullptr;
+	{
+		std::shared_lock lock(m_polled_mutex);
+		if (const auto found = m_polled_ranges.find(vaddr);
+		    found != m_polled_ranges.end() && found->second->size == size) {
+			range = found->second.get();
+		}
+	}
+	if (range == nullptr) {
+		// Only loads that keep faulting are treated as polling.
+		std::unique_lock lock(m_polled_mutex);
+		if (++m_poll_counts[(vaddr << 4u) | size] < PolledThreshold) {
+			return false;
+		}
+		auto& entry = m_polled_ranges[vaddr];
+		if (entry == nullptr) {
+			entry       = std::make_unique<PolledRange>();
+			entry->size = size;
+			std::printf("PolledRead: serving 0x%llx+%llu from the backing with async refresh\n",
+			            static_cast<unsigned long long>(vaddr),
+			            static_cast<unsigned long long>(size));
+		}
+		if (entry->size != size) {
+			return false;
+		}
+		range = entry.get();
+	}
+	if (!LibKernel::Memory::TryReadBacking(vaddr, data, size)) {
+		return false;
+	}
+	if (!range->refresh_pending.exchange(true, std::memory_order_acq_rel)) {
+		GetGpu().SendCommand([this, vaddr, size, range] {
+			m_buffer_cache.RefreshPolledRange(vaddr, size, [range] {
+				range->refresh_pending.store(false, std::memory_order_release);
+			});
+		});
 	}
 	return true;
 }
